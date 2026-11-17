@@ -23,6 +23,10 @@ except ImportError:  # Python 3.8
 
 from calendar_render import month_bounds, next_month, render_month
 from schedule_dates import DateParseError, format_days, parse_dates, parse_month
+from schedule_times import (
+    TimeParseError, best_slots, format_windows, gm_calendar_days, group_days_by_windows,
+    is_all_day, parse_times, player_calendar_days, player_day_summary,
+)
 from schedule_store import ScheduleStore, prune_backups
 
 load_dotenv()
@@ -100,6 +104,14 @@ def parse_future(spec: str):
     return future, len(days) - len(future)
 
 
+TIME_HELP = "e.g. 'after 7pm', '7pm-10pm', 'evenings'. Leave empty for all day"
+
+
+def at(windows) -> str:
+    """' (from 19:00)' for a partial day, '' for a whole day."""
+    return '' if is_all_day(windows) else f' ({format_windows(windows)})'
+
+
 def past_note(dropped: int) -> str:
     if not dropped:
         return ''
@@ -108,8 +120,8 @@ def past_note(dropped: int) -> str:
 
 async def render_month_file(year: int, month: int, filename: str = None) -> discord.File:
     start, end = month_bounds(year, month)
-    gm = await asyncio.to_thread(store.gm_days, start, end)
-    players = await asyncio.to_thread(store.player_days, start, end)
+    gm = gm_calendar_days(await asyncio.to_thread(store.gm_days, start, end))
+    players = player_calendar_days(await asyncio.to_thread(store.player_days, start, end))
     png = await asyncio.to_thread(
         render_month, year, month, gm, players, today(), config['calendar_title']
     )
@@ -151,7 +163,7 @@ def pinned_text() -> str:
     stamp = int(datetime.now(TZ).timestamp())
     return (
         '**Session calendar**: this month and next. Green is when the GM is free.\n'
-        'Mark your own dates with `/available` and `/unavailable`. '
+        'Add your own availability with `/available` and `/unavailable`. '
         f'`/calendar` shows any month.\n-# Updated <t:{stamp}:R>'
     )
 
@@ -216,7 +228,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await send_error(interaction, 'Only the GM can do that.')
         return
     original = getattr(error, 'original', error)
-    if isinstance(original, DateParseError):
+    if isinstance(original, (DateParseError, TimeParseError)):
         await send_error(interaction, str(original))
         return
     print(f'Command error in /{interaction.command.qualified_name if interaction.command else "?"}: {error!r}')
@@ -228,48 +240,52 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 gm = app_commands.Group(name='gm', description='GM scheduling commands', guild_only=True)
 
 
-@gm.command(name='open', description='Mark dates when you can run a session')
+@gm.command(name='open', description='Mark when you can run a session')
 @app_commands.describe(
     dates="e.g. '3-7 Dec', '5, 12, 19 Dec', 'December'",
-    note="Optional, e.g. 'evenings only' (shown on the calendar)",
+    time=TIME_HELP,
+    note="Optional, shown on the calendar",
 )
 @is_gm()
-async def gm_open(interaction: discord.Interaction, dates: str, note: Optional[str] = ''):
+async def gm_open(interaction: discord.Interaction, dates: str, time: Optional[str] = None, note: Optional[str] = ''):
     days, dropped = parse_future(dates)
+    windows = parse_times(time)
     if not days:
         await send_error(interaction, 'All of those dates are in the past.')
         return
-    await asyncio.to_thread(store.set_gm_days, days, 'open', note or '')
+    await asyncio.to_thread(store.set_gm_days, days, 'open', windows, note or '')
     await interaction.response.send_message(
-        f'Marked you **free** on {format_days(days)}.' + (f' Note: {note}' if note else '') + past_note(dropped),
+        f'Marked you **free** on {format_days(days)}{at(windows)}.' + (f' Note: {note}' if note else '') + past_note(dropped),
         ephemeral=True,
     )
     schedule_refresh()
 
 
-@gm.command(name='block', description="Mark dates when you can't run a session")
-@app_commands.describe(dates="e.g. '20 Dec - 3 Jan', 'January'", note='Optional note shown on the calendar')
+@gm.command(name='block', description="Mark when you can't run a session")
+@app_commands.describe(dates="e.g. '20 Dec - 3 Jan', 'January'", time=TIME_HELP, note='Optional note shown on the calendar')
 @is_gm()
-async def gm_block(interaction: discord.Interaction, dates: str, note: Optional[str] = ''):
+async def gm_block(interaction: discord.Interaction, dates: str, time: Optional[str] = None, note: Optional[str] = ''):
     days, dropped = parse_future(dates)
+    windows = parse_times(time)
     if not days:
         await send_error(interaction, 'All of those dates are in the past.')
         return
-    await asyncio.to_thread(store.set_gm_days, days, 'blocked', note or '')
+    await asyncio.to_thread(store.set_gm_days, days, 'blocked', windows, note or '')
     await interaction.response.send_message(
-        f'Marked you **away** on {format_days(days)}.' + past_note(dropped), ephemeral=True
+        f'Marked you **away** on {format_days(days)}{at(windows)}.' + past_note(dropped), ephemeral=True
     )
     schedule_refresh()
 
 
-@gm.command(name='clear', description='Remove your open/blocked marks from dates')
-@app_commands.describe(dates="e.g. '3-7 Dec' or 'December'")
+@gm.command(name='clear', description='Remove your availability from dates')
+@app_commands.describe(dates="e.g. '3-7 Dec' or 'December'", time="Only clear this time of day. Leave empty to clear the whole day")
 @is_gm()
-async def gm_clear(interaction: discord.Interaction, dates: str):
+async def gm_clear(interaction: discord.Interaction, dates: str, time: Optional[str] = None):
     days, _ = parse_future(dates)
-    removed = await asyncio.to_thread(store.clear_gm_days, days)
+    windows = parse_times(time)
+    changed = await asyncio.to_thread(store.clear_gm_days, days, windows)
     await interaction.response.send_message(
-        f'Cleared {removed} date{"s" if removed != 1 else ""} ({format_days(days)}).', ephemeral=True
+        f'Cleared your availability on {changed} day{"s" if changed != 1 else ""}{at(windows)}.', ephemeral=True
     )
     schedule_refresh()
 
@@ -321,60 +337,76 @@ bot.tree.add_command(gm)
 
 # -------------------------------------------------------- player commands
 
-@bot.tree.command(name='available', description="Mark dates you're free to play")
-@app_commands.describe(dates="e.g. '3-7 Dec', '5, 12, 19 Dec', 'December'")
-@app_commands.guild_only()
-async def available(interaction: discord.Interaction, dates: str):
+async def set_own_availability(interaction: discord.Interaction, dates: str, time: Optional[str], free: bool):
     days, dropped = parse_future(dates)
+    windows = parse_times(time)
     if not days:
         await send_error(interaction, 'All of those dates are in the past.')
         return
-    await asyncio.to_thread(store.set_player_days, interaction.user.id, interaction.user.display_name, days, True)
+    await asyncio.to_thread(
+        store.set_player_days, interaction.user.id, interaction.user.display_name, days, free, windows
+    )
     await interaction.response.send_message(
-        f'Marked you **free** on {format_days(days)}.' + past_note(dropped), ephemeral=True
+        f"Marked you **{'free' if free else 'busy'}** on {format_days(days)}{at(windows)}." + past_note(dropped),
+        ephemeral=True,
     )
     schedule_refresh()
 
 
-@bot.tree.command(name='unavailable', description="Mark dates you can't play")
-@app_commands.describe(dates="e.g. '20 Dec - 3 Jan'")
+@bot.tree.command(name='available', description="Say when you're free to play")
+@app_commands.describe(dates="e.g. '3-7 Dec', '5, 12, 19 Dec', 'December'", time=TIME_HELP)
 @app_commands.guild_only()
-async def unavailable(interaction: discord.Interaction, dates: str):
-    days, dropped = parse_future(dates)
-    if not days:
-        await send_error(interaction, 'All of those dates are in the past.')
-        return
-    await asyncio.to_thread(store.set_player_days, interaction.user.id, interaction.user.display_name, days, False)
-    await interaction.response.send_message(
-        f'Marked you **busy** on {format_days(days)}.' + past_note(dropped), ephemeral=True
-    )
-    schedule_refresh()
+async def available(interaction: discord.Interaction, dates: str, time: Optional[str] = None):
+    await set_own_availability(interaction, dates, time, True)
 
 
-@bot.tree.command(name='clear_availability', description='Remove your free/busy marks from dates')
-@app_commands.describe(dates="e.g. '3-7 Dec' or 'December'")
+@bot.tree.command(name='unavailable', description="Say when you can't play")
+@app_commands.describe(dates="e.g. '20 Dec - 3 Jan'", time=TIME_HELP)
 @app_commands.guild_only()
-async def clear_availability(interaction: discord.Interaction, dates: str):
+async def unavailable(interaction: discord.Interaction, dates: str, time: Optional[str] = None):
+    await set_own_availability(interaction, dates, time, False)
+
+
+@bot.tree.command(name='clear_availability', description='Remove your availability from dates')
+@app_commands.describe(dates="e.g. '3-7 Dec' or 'December'", time="Only clear this time of day. Leave empty to clear the whole day")
+@app_commands.guild_only()
+async def clear_availability(interaction: discord.Interaction, dates: str, time: Optional[str] = None):
     days, _ = parse_future(dates)
-    removed = await asyncio.to_thread(store.clear_player_days, interaction.user.id, days)
+    windows = parse_times(time)
+    changed = await asyncio.to_thread(store.clear_player_days, interaction.user.id, days, windows)
     await interaction.response.send_message(
-        f'Cleared {removed} date{"s" if removed != 1 else ""}.', ephemeral=True
+        f'Cleared your availability on {changed} day{"s" if changed != 1 else ""}{at(windows)}.', ephemeral=True
     )
     schedule_refresh()
 
 
-@bot.tree.command(name='my_availability', description="See the dates you've marked over the next 90 days")
+@bot.tree.command(name='my_availability', description="See the availability you've set over the next 90 days")
 @app_commands.guild_only()
 async def my_availability(interaction: discord.Interaction):
     t = today()
     own = await asyncio.to_thread(store.player_own_days, interaction.user.id, t, t + timedelta(days=90))
-    free = [d for d, f in own.items() if f]
-    busy = [d for d, f in own.items() if not f]
-    if not own:
-        msg = "You haven't marked any dates yet. Try `/available 3-7 Dec`."
-    else:
-        msg = f'**Free:** {format_days(free) if free else "none"}\n**Busy:** {format_days(busy) if busy else "none"}'
-    await interaction.response.send_message(msg, ephemeral=True)
+    free, busy = {}, {}
+    for day, rows in own.items():
+        f, b = player_day_summary(rows)
+        if f:
+            free[day] = f
+        if b:
+            busy[day] = b
+    if not free and not busy:
+        await interaction.response.send_message(
+            "You haven't set any availability yet. Try `/available 3-7 Dec` or `/available 12 Dec after 7pm`.",
+            ephemeral=True,
+        )
+        return
+
+    def section(title, per_day):
+        if not per_day:
+            return f'**{title}:** none'
+        lines = [f'• {label}: {format_days(days)}' for label, days in group_days_by_windows(per_day).items()]
+        return f'**{title}**\n' + '\n'.join(lines)
+
+    msg = section('Free', free) + '\n\n' + section('Busy', busy)
+    await interaction.response.send_message(msg[:1900], ephemeral=True)
 
 
 @bot.tree.command(name='calendar', description='Show the session calendar for a month')
@@ -390,7 +422,13 @@ async def calendar_cmd(interaction: discord.Interaction, month: Optional[str] = 
     await interaction.followup.send(file=file, ephemeral=private)
 
 
-@bot.tree.command(name='whosfree', description='Who has marked themselves free or busy on a date')
+def _people(entries, limit=1000) -> str:
+    """'Sam, Bea (from 19:00)' lines, trimmed to fit an embed field."""
+    text = '\n'.join(entries)
+    return text if len(text) <= limit else text[:limit].rsplit('\n', 1)[0] + '\n…'
+
+
+@bot.tree.command(name='whosfree', description='Who can play on a date, and when')
 @app_commands.rename(day='date')
 @app_commands.describe(day="e.g. '12 Dec' or 'tomorrow'")
 @app_commands.guild_only()
@@ -400,18 +438,46 @@ async def whosfree(interaction: discord.Interaction, day: str):
         await send_error(interaction, 'Give me one date, e.g. `12 Dec`.')
         return
     d = days[0]
-    gm_days = await asyncio.to_thread(store.gm_days, d, d)
-    players = (await asyncio.to_thread(store.player_days, d, d)).get(d, {'free': [], 'busy': []})
+    gm_rows = (await asyncio.to_thread(store.gm_days, d, d)).get(d, [])
+    people = (await asyncio.to_thread(store.player_days, d, d)).get(d, {})
+    gm_state = gm_calendar_days({d: gm_rows}).get(d)
+
+    free, busy = {}, {}   # name -> windows
+    for name, rows in people.values():
+        name = name if name not in free and name not in busy else f'{name} (2)'
+        f, b = player_day_summary(rows)
+        if f:
+            free[name] = f
+        elif b:
+            busy[name] = b
 
     embed = discord.Embed(title=f'{d:%A} {d.day} {d:%B %Y}', color=discord.Color.dark_gold())
-    if d in gm_days:
-        state, note = gm_days[d]
-        gm_line = ('🟢 Free' if state == 'open' else '🔴 Away') + (f': {note}' if note else '')
+    if gm_state:
+        state, windows, note = gm_state
+        gm_line = ('🟢 Free' if state == 'open' else '🔴 Away') + at(windows) + (f': {note}' if note else '')
     else:
-        gm_line = 'Not marked'
+        gm_line = 'Not set'
     embed.add_field(name='GM', value=gm_line, inline=False)
-    embed.add_field(name=f"Free ({len(players['free'])})", value=', '.join(players['free']) or 'Nobody yet', inline=False)
-    embed.add_field(name=f"Busy ({len(players['busy'])})", value=', '.join(players['busy']) or 'Nobody', inline=False)
+
+    if gm_state and gm_state[0] == 'open' and free:
+        slots = best_slots(gm_state[1], free)
+        if slots:
+            slots.sort(key=lambda sl: (-len(sl[2]), sl[0]))
+            lines = [f"**{format_windows([(a, b)])}**: {len(names)} · {', '.join(names)}" for a, b, names in slots[:5]]
+            embed.add_field(name='When you can all play', value=_people(lines), inline=False)
+        else:
+            embed.add_field(name='When you can all play', value='No overlap between the GM and the players yet.', inline=False)
+
+    embed.add_field(
+        name=f'Free ({len(free)})',
+        value=_people(f'{n}{at(w)}' for n, w in sorted(free.items(), key=lambda kv: kv[0].lower())) or 'Nobody yet',
+        inline=False,
+    )
+    embed.add_field(
+        name=f'Busy ({len(busy)})',
+        value=_people(f'{n}{at(w)}' for n, w in sorted(busy.items(), key=lambda kv: kv[0].lower())) or 'Nobody',
+        inline=False,
+    )
     await interaction.response.send_message(embed=embed)
 
 
@@ -421,28 +487,32 @@ async def schedule_help(interaction: discord.Interaction):
         title='📅 Session scheduler',
         description=(
             'Dates can be typed loosely: `12 Dec`, `3-7 Dec`, `5, 12, 19 Dec`, '
-            '`28 Dec - 3 Jan`, `December`, `tomorrow`, `2026-12-03`.'
+            '`28 Dec - 3 Jan`, `December`, `tomorrow`, `2026-12-03`.\n'
+            'Add a `time` if you are only free for part of the day: `after 7pm`, `before 5pm`, '
+            '`7pm-10pm`, `19:00-22:00`, `morning`, `afternoon`, `evenings`, or several joined by '
+            'commas (`12-2pm, 7-10pm`). Leave it empty for all day. Times are UK time.\n'
+            'Setting a day again replaces what you set before for that day.'
         ),
         color=discord.Color.dark_gold(),
     )
     embed.add_field(
         name='Everyone',
         value=(
-            '`/available <dates>`: mark when you can play\n'
-            "`/unavailable <dates>`: mark when you can't\n"
-            '`/clear_availability <dates>`: remove your marks\n'
-            '`/my_availability`: your marks for the next 90 days\n'
+            '`/available <dates> [time]`: say when you can play\n'
+            "`/unavailable <dates> [time]`: say when you can't\n"
+            '`/clear_availability <dates> [time]`: remove your availability\n'
+            '`/my_availability`: your availability for the next 90 days\n'
             '`/calendar [month]`: month view\n'
-            '`/whosfree <date>`: who can make a date'
+            '`/whosfree <date>`: who can play on a date, and when'
         ),
         inline=False,
     )
     embed.add_field(
         name='GM',
         value=(
-            '`/gm open <dates> [note]`: dates you can run\n'
-            "`/gm block <dates> [note]`: dates you can't\n"
-            '`/gm clear <dates>`: remove marks\n'
+            '`/gm open <dates> [time] [note]`: when you can run\n'
+            "`/gm block <dates> [time] [note]`: when you can't\n"
+            '`/gm clear <dates> [time]`: remove your availability\n'
             '`/gm pin_calendar`: post a self-updating calendar in this channel'
         ),
         inline=False,

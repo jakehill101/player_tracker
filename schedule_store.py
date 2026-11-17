@@ -15,7 +15,10 @@ from collections import defaultdict
 from datetime import date, datetime, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from schedule_times import DAY, Window, merge, subtract
+
 GM_STATES = ('open', 'blocked')
+PLAYER_STATES = ('free', 'busy')
 
 # Each entry upgrades the schema by one version. Append only; never edit a
 # migration that has shipped.
@@ -41,6 +44,39 @@ MIGRATIONS = [
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    """,
+    # 2: times of day. Existing whole-day rows become all-day windows.
+    """
+    CREATE TABLE gm_availability_v2 (
+        day        TEXT NOT NULL,
+        state      TEXT NOT NULL CHECK (state IN ('open', 'blocked')),
+        start_min  INTEGER NOT NULL CHECK (start_min >= 0 AND start_min < 1440),
+        end_min    INTEGER NOT NULL CHECK (end_min > start_min AND end_min <= 1440),
+        note       TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (day, state, start_min)
+    );
+    INSERT INTO gm_availability_v2 (day, state, start_min, end_min, note, updated_at)
+        SELECT day, state, 0, 1440, note, updated_at FROM gm_availability;
+    DROP TABLE gm_availability;
+    ALTER TABLE gm_availability_v2 RENAME TO gm_availability;
+
+    CREATE TABLE player_availability_v2 (
+        user_id      TEXT NOT NULL,
+        day          TEXT NOT NULL,
+        state        TEXT NOT NULL CHECK (state IN ('free', 'busy')),
+        start_min    INTEGER NOT NULL CHECK (start_min >= 0 AND start_min < 1440),
+        end_min      INTEGER NOT NULL CHECK (end_min > start_min AND end_min <= 1440),
+        display_name TEXT NOT NULL DEFAULT '',
+        updated_at   TEXT NOT NULL,
+        PRIMARY KEY (user_id, day, state, start_min)
+    );
+    INSERT INTO player_availability_v2 (user_id, day, state, start_min, end_min, display_name, updated_at)
+        SELECT user_id, day, CASE free WHEN 1 THEN 'free' ELSE 'busy' END, 0, 1440, display_name, updated_at
+        FROM player_availability;
+    DROP TABLE player_availability;
+    ALTER TABLE player_availability_v2 RENAME TO player_availability;
+    CREATE INDEX player_availability_day ON player_availability (day);
     """,
 ]
 
@@ -75,6 +111,11 @@ class ScheduleStore:
 
     def _migrate(self):
         version = self._conn.execute('PRAGMA user_version').fetchone()[0]
+        if version == len(MIGRATIONS):
+            return
+        if version > 0 and self.path != ':memory:':
+            # Keep a copy of the data as it was before the upgrade
+            self._copy_to(f'{self.path}.before-v{version + 1}')
         for i, sql in enumerate(MIGRATIONS[version:], start=version + 1):
             try:
                 self._conn.executescript('BEGIN;' + sql + f'PRAGMA user_version = {i}; COMMIT;')
@@ -82,6 +123,17 @@ class ScheduleStore:
                 if self._conn.in_transaction:
                     self._conn.rollback()
                 raise
+
+    def _copy_to(self, dest_path: str):
+        """Consistent copy of the live database. Caller holds the lock (or is still starting up)."""
+        os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+        tmp = dest_path + '.tmp'
+        dest = sqlite3.connect(tmp)
+        try:
+            self._conn.backup(dest)
+        finally:
+            dest.close()
+        os.replace(tmp, dest_path)
 
     @property
     def schema_version(self) -> int:
@@ -92,91 +144,162 @@ class ScheduleStore:
         with self._lock:
             self._conn.close()
 
+    # ------------------------------------------------------- shared logic
+    # `table` and `owner` only ever come from the constants below, never from
+    # user input, so formatting them into SQL is safe. All values are bound.
+
+    @staticmethod
+    def _check_windows(windows: Optional[Iterable[Window]]) -> List[Window]:
+        ws = merge(windows) if windows is not None else [DAY]
+        if not ws:
+            raise ValueError('at least one time window is needed')
+        for s, e in ws:
+            if not (0 <= s < e <= 1440):
+                raise ValueError(f'bad window {(s, e)}')
+        return ws
+
+    def _set_windows(self, table, owner, days, state, windows, extra):
+        """Latest command wins: replace this owner's windows of `state` on each day,
+        and cut the new windows out of anything of the other state."""
+        where = ''.join(f' AND {c} = ?' for c in owner)
+        owner_vals = list(owner.values())
+        now = _now()
+        count = 0
+        for day in days:
+            iso = day.isoformat()
+            self._conn.execute(
+                f'DELETE FROM {table} WHERE day = ?{where} AND state = ?', [iso, *owner_vals, state]
+            )
+            for row in self._conn.execute(f'SELECT * FROM {table} WHERE day = ?{where}', [iso, *owner_vals]).fetchall():
+                span = (row['start_min'], row['end_min'])
+                pieces = subtract([span], windows)
+                if pieces == [span]:
+                    continue
+                self._conn.execute(
+                    f'DELETE FROM {table} WHERE day = ?{where} AND state = ? AND start_min = ?',
+                    [iso, *owner_vals, row['state'], row['start_min']],
+                )
+                for ps, pe in pieces:
+                    values = dict(zip(row.keys(), tuple(row)))
+                    values.update(start_min=ps, end_min=pe, updated_at=now)
+                    self._insert(table, values)
+            for ws, we in windows:
+                self._insert(table, {'day': iso, **owner, 'state': state, 'start_min': ws, 'end_min': we,
+                                     **extra, 'updated_at': now})
+            count += 1
+        return count
+
+    def _insert(self, table, values: dict):
+        cols = ', '.join(values)
+        marks = ', '.join('?' for _ in values)
+        self._conn.execute(f'INSERT INTO {table} ({cols}) VALUES ({marks})', list(values.values()))
+
+    def _remove_windows(self, table, owner, days, windows):
+        """Remove availability on each day: all of it, or just the given windows."""
+        where = ''.join(f' AND {c} = ?' for c in owner)
+        owner_vals = list(owner.values())
+        changed = 0
+        for day in days:
+            iso = day.isoformat()
+            rows = self._conn.execute(f'SELECT * FROM {table} WHERE day = ?{where}', [iso, *owner_vals]).fetchall()
+            if not rows:
+                continue
+            if windows is None or merge(windows) == [DAY]:
+                self._conn.execute(f'DELETE FROM {table} WHERE day = ?{where}', [iso, *owner_vals])
+                changed += 1
+                continue
+            touched = False
+            for row in rows:
+                span = (row['start_min'], row['end_min'])
+                pieces = subtract([span], windows)
+                if pieces == [span]:
+                    continue
+                touched = True
+                self._conn.execute(
+                    f'DELETE FROM {table} WHERE day = ?{where} AND state = ? AND start_min = ?',
+                    [iso, *owner_vals, row['state'], row['start_min']],
+                )
+                for ps, pe in pieces:
+                    values = dict(zip(row.keys(), tuple(row)))
+                    values.update(start_min=ps, end_min=pe)
+                    self._insert(table, values)
+            changed += 1 if touched else 0
+        return changed
+
     # ------------------------------------------------------------------ GM
 
-    def set_gm_days(self, days: Iterable[date], state: str, note: str = '') -> int:
+    def set_gm_days(self, days: Iterable[date], state: str, windows: Optional[Iterable[Window]] = None,
+                    note: str = '') -> int:
+        """Mark days open or blocked for the given time windows (default all day)."""
         if state not in GM_STATES:
             raise ValueError(f'state must be one of {GM_STATES}')
-        note = _clean(note, NOTE_MAX)
-        now = _now()
-        rows = [(d.isoformat(), state, note, now) for d in days]
+        ws = self._check_windows(windows)
         with self._lock, self._conn:
-            self._conn.executemany(
-                'INSERT INTO gm_availability (day, state, note, updated_at) VALUES (?, ?, ?, ?) '
-                'ON CONFLICT(day) DO UPDATE SET state = excluded.state, note = excluded.note, '
-                'updated_at = excluded.updated_at',
-                rows,
-            )
-        return len(rows)
+            return self._set_windows('gm_availability', {}, days, state, ws, {'note': _clean(note, NOTE_MAX)})
 
-    def clear_gm_days(self, days: Iterable[date]) -> int:
-        keys = [(d.isoformat(),) for d in days]
+    def clear_gm_days(self, days: Iterable[date], windows: Optional[Iterable[Window]] = None) -> int:
+        """Clear whole days, or only the given time windows. Returns days changed."""
         with self._lock, self._conn:
-            before = self._conn.total_changes
-            self._conn.executemany('DELETE FROM gm_availability WHERE day = ?', keys)
-            return self._conn.total_changes - before
+            return self._remove_windows('gm_availability', {}, days, windows)
 
-    def gm_days(self, start: date, end: date) -> Dict[date, Tuple[str, str]]:
-        """{date: (state, note)} for start..end inclusive."""
+    def gm_days(self, start: date, end: date) -> Dict[date, List[Tuple[str, int, int, str]]]:
+        """{date: [(state, start_min, end_min, note)]} for start..end inclusive."""
         with self._lock:
             rows = self._conn.execute(
-                'SELECT day, state, note FROM gm_availability WHERE day BETWEEN ? AND ? ORDER BY day',
+                'SELECT day, state, start_min, end_min, note FROM gm_availability '
+                'WHERE day BETWEEN ? AND ? ORDER BY day, start_min',
                 (start.isoformat(), end.isoformat()),
             ).fetchall()
-        return {date.fromisoformat(r['day']): (r['state'], r['note']) for r in rows}
+        out = defaultdict(list)
+        for r in rows:
+            out[date.fromisoformat(r['day'])].append((r['state'], r['start_min'], r['end_min'], r['note']))
+        return dict(out)
 
     # ------------------------------------------------------------- players
 
-    def set_player_days(self, user_id, display_name: str, days: Iterable[date], free: bool) -> int:
+    def set_player_days(self, user_id, display_name: str, days: Iterable[date], free: bool,
+                        windows: Optional[Iterable[Window]] = None) -> int:
+        """Mark days free or busy for the given time windows (default all day)."""
         user_id = str(user_id)
         name = _clean(display_name, NAME_MAX)
-        now = _now()
-        rows = [(user_id, d.isoformat(), 1 if free else 0, name, now) for d in days]
+        ws = self._check_windows(windows)
         with self._lock, self._conn:
-            self._conn.executemany(
-                'INSERT INTO player_availability (user_id, day, free, display_name, updated_at) '
-                'VALUES (?, ?, ?, ?, ?) '
-                'ON CONFLICT(user_id, day) DO UPDATE SET free = excluded.free, '
-                'display_name = excluded.display_name, updated_at = excluded.updated_at',
-                rows,
-            )
+            n = self._set_windows('player_availability', {'user_id': user_id}, days,
+                                  'free' if free else 'busy', ws, {'display_name': name})
             # Keep the name current on all of this player's rows
-            self._conn.execute(
-                'UPDATE player_availability SET display_name = ? WHERE user_id = ?', (name, user_id)
-            )
-        return len(rows)
+            self._conn.execute('UPDATE player_availability SET display_name = ? WHERE user_id = ?', (name, user_id))
+        return n
 
-    def clear_player_days(self, user_id, days: Iterable[date]) -> int:
-        user_id = str(user_id)
-        keys = [(user_id, d.isoformat()) for d in days]
+    def clear_player_days(self, user_id, days: Iterable[date], windows: Optional[Iterable[Window]] = None) -> int:
         with self._lock, self._conn:
-            before = self._conn.total_changes
-            self._conn.executemany(
-                'DELETE FROM player_availability WHERE user_id = ? AND day = ?', keys
-            )
-            return self._conn.total_changes - before
+            return self._remove_windows('player_availability', {'user_id': str(user_id)}, days, windows)
 
-    def player_days(self, start: date, end: date) -> Dict[date, Dict[str, List[str]]]:
-        """{date: {'free': [names], 'busy': [names]}} for start..end inclusive."""
+    def player_days(self, start: date, end: date) -> Dict[date, Dict[str, Tuple[str, List[Tuple[str, int, int]]]]]:
+        """{date: {user_id: (name, [(state, start_min, end_min)])}} for start..end inclusive."""
         with self._lock:
             rows = self._conn.execute(
-                'SELECT day, free, display_name FROM player_availability '
-                'WHERE day BETWEEN ? AND ? ORDER BY display_name COLLATE NOCASE',
+                'SELECT user_id, day, state, start_min, end_min, display_name FROM player_availability '
+                'WHERE day BETWEEN ? AND ? ORDER BY day, display_name COLLATE NOCASE, start_min',
                 (start.isoformat(), end.isoformat()),
             ).fetchall()
-        out = defaultdict(lambda: {'free': [], 'busy': []})
+        out: Dict = defaultdict(dict)
         for r in rows:
-            out[date.fromisoformat(r['day'])]['free' if r['free'] else 'busy'].append(r['display_name'])
+            day = out[date.fromisoformat(r['day'])]
+            name, windows = day.setdefault(r['user_id'], (r['display_name'], []))
+            windows.append((r['state'], r['start_min'], r['end_min']))
         return dict(out)
 
-    def player_own_days(self, user_id, start: date, end: date) -> Dict[date, bool]:
+    def player_own_days(self, user_id, start: date, end: date) -> Dict[date, List[Tuple[str, int, int]]]:
         with self._lock:
             rows = self._conn.execute(
-                'SELECT day, free FROM player_availability '
-                'WHERE user_id = ? AND day BETWEEN ? AND ? ORDER BY day',
+                'SELECT day, state, start_min, end_min FROM player_availability '
+                'WHERE user_id = ? AND day BETWEEN ? AND ? ORDER BY day, start_min',
                 (str(user_id), start.isoformat(), end.isoformat()),
             ).fetchall()
-        return {date.fromisoformat(r['day']): bool(r['free']) for r in rows}
+        out = defaultdict(list)
+        for r in rows:
+            out[date.fromisoformat(r['day'])].append((r['state'], r['start_min'], r['end_min']))
+        return dict(out)
 
     # ------------------------------------------------------------ settings
 
@@ -200,15 +323,8 @@ class ScheduleStore:
 
     def backup(self, dest_path: str):
         """Consistent copy of the live database (safe while the bot is running)."""
-        os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
-        tmp = dest_path + '.tmp'
-        dest = sqlite3.connect(tmp)
-        try:
-            with self._lock:
-                self._conn.backup(dest)
-        finally:
-            dest.close()
-        os.replace(tmp, dest_path)
+        with self._lock:
+            self._copy_to(dest_path)
 
 
 def prune_backups(backup_dir: str, keep: int, prefix: str = 'schedule-') -> List[str]:

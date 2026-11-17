@@ -10,6 +10,8 @@ from typing import Dict, List, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
+from schedule_times import DAY, format_windows, merge
+
 # Parchment palette: reads on both Discord light and dark themes.
 BG = (244, 236, 216)
 INK = (59, 47, 34)
@@ -66,8 +68,10 @@ def render_month(
 ) -> bytes:
     """Render one month.
 
-    gm_days: {date: ('open' | 'blocked', note)}
+    gm_days: {date: ('open' | 'blocked', [(start_min, end_min)], note)}
+        (see schedule_times.gm_calendar_days)
     player_days: {date: {'free': [names], 'busy': [names]}}
+        (see schedule_times.player_calendar_days)
     """
     weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)  # Monday first
     width = MARGIN * 2 + CELL_W * 7
@@ -128,9 +132,14 @@ def render_month(
                     [x1 - tw - 18, y0 + 10, x1 - 8, y0 + 28], radius=6, fill=edge
                 )
                 draw.text((x1 - tw - 13, y0 + 12), tag, font=f_tag, fill=(255, 255, 255))
-                if gm[1]:
-                    note = _fit(draw, gm[1], f_small, CELL_W - pad * 2)
-                    draw.text((x0 + pad, y0 + 38), note, font=f_small, fill=INK)
+                text_y = y0 + 38
+                if merge(gm[1]) != [DAY]:
+                    times = _fit(draw, format_windows(gm[1]), f_tag, CELL_W - pad * 2)
+                    draw.text((x0 + pad, text_y), times, font=f_tag, fill=INK)
+                    text_y += 17
+                if gm[2]:
+                    note = _fit(draw, gm[2], f_small, CELL_W - pad * 2)
+                    draw.text((x0 + pad, text_y), note, font=f_small, fill=MUTED)
 
             if players and (players['free'] or players['busy']):
                 free = players['free']

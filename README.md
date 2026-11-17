@@ -36,8 +36,9 @@ See [TIMEKEEPER_GUIDE.md](TIMEKEEPER_GUIDE.md) for detailed documentation on the
 See [ADVENTURE_GUIDE.md](ADVENTURE_GUIDE.md) for detailed documentation on creating and managing adventures.
 
 ### Session Scheduler (NEW)
-- **GM Availability**: Mark the days you can (or can't) run, a month at a time: `/gm open 3, 5, 12 Dec evenings`
-- **Player Availability**: Players mark when they're free with `/available` and `/unavailable`
+- **GM Availability**: Say when you can (or can't) run, a month at a time: `/gm open 3, 5, 12 Dec after 7pm`
+- **Player Availability**: Players say when they're free with `/available` and `/unavailable`, whole days or just part of a day
+- **Overlap**: `/whosfree 12 Dec` shows the times the GM and players are all free
 - **Calendar View**: `/calendar` posts a month grid; `/gm pin_calendar` keeps a self-updating one pinned
 - **Its own database**: SQLite on the VM with nightly backups, separate from the Google Sheet
 
@@ -345,7 +346,7 @@ Using the merchant bot's GM commands, you can create custom shops for different 
 - **inn_bot.py**: Separate Discord bot for inn management
 - **adventure_bot.py**: Separate Discord bot for choose-your-own-adventure events
 - **scheduler_bot.py**: Separate Discord bot for availability and the session calendar (NEW)
-- **schedule_dates.py / schedule_store.py / calendar_render.py**: Scheduler date parsing, SQLite storage and calendar image
+- **schedule_dates.py / schedule_times.py / schedule_store.py / calendar_render.py**: Scheduler date and time parsing, SQLite storage and calendar image
 - **scheduler_config.yaml**: Scheduler settings (timezone, database path, backups)
 - **storage.py**: Google Sheets integration for data persistence
 - **dnd_utils.py**: D&D 5e game mechanics (XP thresholds, currency conversion, level calculations)
