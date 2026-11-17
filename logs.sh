@@ -18,6 +18,10 @@ elif [ "$1" = "adventure" ]; then
     shift
     SERVICE="adventure_bot"
     SERVICE_NAME="Adventure Bot"
+elif [ "$1" = "scheduler" ]; then
+    shift
+    SERVICE="scheduler_bot"
+    SERVICE_NAME="Scheduler Bot"
 elif [ "$1" = "tracker" ] || [ "$1" = "player" ]; then
     shift
     SERVICE="player_tracker"
@@ -50,4 +54,5 @@ else
     echo "  timekeeper      - Timekeeper bot"
     echo "  inn             - Inn bot"
     echo "  adventure       - Adventure bot"
+    echo "  scheduler       - Scheduler bot"
 fi

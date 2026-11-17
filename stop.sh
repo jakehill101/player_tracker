@@ -22,3 +22,7 @@ echo ""
 echo "Stopping Adventure bot..."
 sudo systemctl stop adventure_bot.service
 echo "✓ Adventure Bot service stopped"
+echo ""
+echo "Stopping Scheduler bot..."
+sudo systemctl stop scheduler_bot.service
+echo "✓ Scheduler Bot service stopped"

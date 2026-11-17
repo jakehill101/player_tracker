@@ -43,5 +43,12 @@ token.json
 .DS_Store
 Thumbs.db
 
+# Scheduler database and backups
+data/
+backups/
+*.db
+*.db-wal
+*.db-shm
+
 # Deployment
 player_tracker.service.tmp
