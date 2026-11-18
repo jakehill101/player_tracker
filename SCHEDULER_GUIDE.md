@@ -18,6 +18,8 @@ Anyone in the server can propose a session. The GM approves it, and everyone can
 
 Proposals nobody answered by their start time expire on their own, and the buttons disappear from finished sessions.
 
+If a button on an old card no longer applies (for example it still shows **Approve** for a session that's already confirmed), pressing it redraws the card as it is now and tells you what happened, rather than doing anything twice.
+
 `/sessions` lists what's coming up, with links to the cards. `/gm hub_line` gives the GM the next confirmed session as lines to paste into the hub home note:
 
 ```yaml
@@ -92,7 +94,7 @@ Typical use: `/gm open 3, 5, 12, 19 Dec after 7pm` then `/gm block 23 Dec - 1 Ja
 ## Setup
 
 1. **Create the bot.** In the [Discord Developer Portal](https://discord.com/developers/applications) make a new application, add a bot and copy its token. It needs no privileged intents.
-2. **Invite it.** OAuth2 → URL Generator → scopes `bot` and `applications.commands`; permissions **View Channels, Send Messages, Embed Links, Attach Files, Read Message History, Manage Messages** (only for pinning) and **Manage Events** (so it can create the Discord event when you approve a session). Without Manage Events everything still works; approving just tells you it couldn't create the event.
+2. **Invite it.** OAuth2 → URL Generator → scopes `bot` and `applications.commands`; permissions **View Channels, Send Messages, Embed Links, Attach Files, Read Message History, Manage Messages** (only for pinning) and **Manage Events** (so it can create the Discord event when you approve a session). Without Manage Events everything still works; approving just tells you it couldn't create the event. Button presses update the card and post their notices through Discord's own reply to the click, so they work even in a channel the bot can't normally see. The bot does need View Channel and Read Message History in the channel to tidy up cards by itself when a proposal expires; if it can't, the card is refreshed the next time someone presses a button on it.
 3. **Configure.** Add `SCHEDULER_BOT_TOKEN=...` to `.env`. `GM_ROLE_ID` is shared with the other bots, and it is also the role pinged when someone proposes a session. Adjust `scheduler_config.yaml` if you want a different calendar title or backup count.
 4. **Install.** `pip install -r requirements.txt` (adds Pillow), then `./deploy.sh`, or install just this service:
    ```bash

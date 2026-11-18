@@ -204,7 +204,8 @@ class SessionManager:
         except discord.NotFound:
             print(f"Card for session #{sid} was deleted.")
         except discord.HTTPException as e:
-            print(f"Could not update card for session #{sid}: {e}")
+            print(f"Could not update card for session #{sid}: {e.status} {e.text}. "
+                  "The bot needs View Channel and Read Message History in that channel.")
 
     async def register_views(self):
         """Make buttons on existing cards work again after a restart."""
@@ -219,21 +220,27 @@ class SessionManager:
 
     # --------------------------------------------------------- notifications
 
-    async def notify(self, s: dict, text: str, user_ids: Iterable[str] = (), ping_gm: bool = False):
-        """Post a short note in the session's channel, pinging only the listed people."""
-        if not s['channel_id']:
-            return
+    async def notify(self, s: dict, text: str, user_ids: Iterable[str] = (), ping_gm: bool = False,
+                     interaction: Optional[discord.Interaction] = None):
+        """Post a short public note, pinging only the listed people (and the GM role if asked).
+
+        Sent through the interaction when there is one, which works wherever the person
+        could click; otherwise through the channel, which needs the bot to have access to it.
+        """
         users = [discord.Object(id=int(u)) for u in dict.fromkeys(user_ids)]
         roles = [discord.Object(id=self.gm_role_id)] if ping_gm and self.gm_role_id else []
         mentions = ' '.join([f'<@&{self.gm_role_id}>'] * bool(roles) + [f'<@{u.id}>' for u in users])
         url = self.jump_url(s)
         content = f"{text}{' ' + url if url else ''}\n{mentions}".strip()
+        mentions_ok = discord.AllowedMentions(everyone=False, users=users, roles=roles, replied_user=False)
         try:
-            await self.bot.get_partial_messageable(int(s['channel_id'])).send(
-                content, allowed_mentions=discord.AllowedMentions(everyone=False, users=users, roles=roles,
-                                                                  replied_user=False))
+            if interaction is not None:
+                await interaction.followup.send(content, allowed_mentions=mentions_ok)
+            elif s['channel_id']:
+                await self.bot.get_partial_messageable(int(s['channel_id'])).send(
+                    content, allowed_mentions=mentions_ok)
         except discord.HTTPException as e:
-            print(f'Could not post a notice for session #{s["id"]}: {e}')
+            print(f'Could not post a notice for session #{s["id"]}: {e.status} {e.text}')
 
     def people(self, s: dict) -> List[str]:
         return [uid for uid, _ in s['players']] or [s['proposer_id']]
@@ -335,14 +342,24 @@ class SessionManager:
 
     # -------------------------------------------------------------- buttons
 
+    ALLOWED = {
+        'proposed': {'join', 'leave', 'approve', 'decline', 'suggest', 'withdraw'},
+        'countered': {'join', 'leave', 'accept', 'suggest', 'decline', 'withdraw'},
+        'confirmed': {'join', 'leave', 'ics', 'suggest', 'cancel'},
+    }
+
     async def handle(self, interaction: discord.Interaction, sid: int, action: str):
         s = await asyncio.to_thread(self.store.get_session, sid)
         if not s:
             return await self._say(interaction, 'That session no longer exists.')
+
+        # An old card whose buttons no longer apply: redraw it and say what happened
+        if action not in self.ALLOWED.get(s['status'], set()):
+            return await self._out_of_date(interaction, s)
+
         user = interaction.user
         gm = self.is_gm(user)
         is_proposer = str(user.id) == s['proposer_id']
-
         if action in ('approve', 'decline', 'suggest') and not gm:
             return await self._say(interaction, 'Only the GM can do that.')
         if action == 'accept' and not is_proposer:
@@ -350,13 +367,26 @@ class SessionManager:
         if action in ('withdraw', 'cancel') and not (gm or is_proposer):
             return await self._say(interaction, 'Only the GM or the person who proposed it can do that.')
 
-        if s['status'] not in SESSION_LIVE:
-            return await self._say(interaction, f"That session is {s['status']}, so there's nothing more to do.")
-
         handler = getattr(self, f'_do_{action}', None)
         if handler is None:
             return await self._say(interaction, "I don't know that button any more.")
-        await handler(interaction, s)
+        try:
+            await handler(interaction, s)
+        except discord.HTTPException as e:
+            print(f"Session #{sid} {action} failed: {e.status} {e.text}")
+            await self._say(interaction, f"Something went wrong talking to Discord ({e.status}). The GM can check the bot logs.")
+
+    async def _redraw(self, interaction: discord.Interaction, sid: int) -> dict:
+        """Answer a click by redrawing the card the button is on. Needs no channel permissions."""
+        s = await asyncio.to_thread(self.store.get_session, sid)
+        embed, view = await self.render(s)
+        await interaction.response.edit_message(embed=embed, view=view)
+        return s
+
+    async def _out_of_date(self, interaction: discord.Interaction, s: dict):
+        await self._redraw(interaction, s['id'])
+        await interaction.followup.send(
+            f"That card was out of date: the session is now **{s['status']}**. I've refreshed it.", ephemeral=True)
 
     async def _do_join(self, interaction, s):
         if self.start_dt(s) <= self.now():
@@ -364,10 +394,10 @@ class SessionManager:
         result = await asyncio.to_thread(self.store.join_session, s['id'], interaction.user.id,
                                          interaction.user.display_name)
         if result == 'closed':
-            return await self._say(interaction, "That session isn't open any more.")
+            return await self._out_of_date(interaction, s)
         if result == 'already':
             return await self._say(interaction, "You're already in this session.")
-        await self._update_in_place(interaction, s['id'])
+        await self._after_party_change(interaction, s['id'])
 
     async def _do_leave(self, interaction, s):
         if self.start_dt(s) <= self.now():
@@ -376,14 +406,11 @@ class SessionManager:
         if result == 'not_in':
             return await self._say(interaction, "You weren't in this session.")
         if result == 'closed':
-            return await self._say(interaction, "That session isn't open any more.")
-        await self._update_in_place(interaction, s['id'])
+            return await self._out_of_date(interaction, s)
+        await self._after_party_change(interaction, s['id'])
 
-    async def _update_in_place(self, interaction, sid):
-        """Answer a button click by redrawing the card the button is on."""
-        s = await asyncio.to_thread(self.store.get_session, sid)
-        embed, view = await self.render(s)
-        await interaction.response.edit_message(embed=embed, view=view)
+    async def _after_party_change(self, interaction, sid):
+        s = await self._redraw(interaction, sid)
         if s['status'] == 'confirmed':
             await self.update_event(s)
         self.refresh_calendar()
@@ -391,61 +418,58 @@ class SessionManager:
     async def _do_approve(self, interaction, s):
         if self.start_dt(s) <= self.now():
             return await self._say(interaction, 'That time has already passed.')
-        await interaction.response.defer(ephemeral=True, thinking=True)
         if not await asyncio.to_thread(self.store.transition, s['id'], ('proposed',), 'confirmed'):
-            return await interaction.followup.send('Someone has already dealt with this one.', ephemeral=True)
-        await self._confirmed(interaction, s['id'], 'Session confirmed')
+            return await self._out_of_date(interaction, s)
+        await self._redraw(interaction, s['id'])        # the card turns green straight away
+        await self._confirmed(interaction, s['id'], 'Session confirmed', for_gm=True)
 
     async def _do_accept(self, interaction, s):
         if self.check_future(s['sug_day'], s['sug_start_min']):
             return await self._say(interaction, 'The suggested time has already passed.')
-        await interaction.response.defer(ephemeral=True, thinking=True)
         if not await asyncio.to_thread(self.store.accept_suggestion, s['id']):
-            return await interaction.followup.send('That suggestion is no longer available.', ephemeral=True)
-        await self._confirmed(interaction, s['id'], 'Suggestion accepted: session confirmed', ping_gm=True)
+            return await self._out_of_date(interaction, s)
+        await self._redraw(interaction, s['id'])
+        await self._confirmed(interaction, s['id'], 'Suggestion accepted: session confirmed', for_gm=False)
 
-    async def _confirmed(self, interaction, sid, headline, ping_gm=False):
+    async def _confirmed(self, interaction, sid, headline, for_gm: bool):
+        """After the card is redrawn: make the Discord event, tell the clicker, tell the party."""
         s = await asyncio.to_thread(self.store.get_session, sid)
         problem = await self.create_event(s)
-        await self.refresh_card(sid)
         s = await asyncio.to_thread(self.store.get_session, sid)
-        await self.notify(s, f"✅ **{headline}** for {self.when_text(s)}.", self.people(s), ping_gm=ping_gm)
+        if for_gm:
+            private = self.hub_lines(s, intro=True)
+        else:
+            private = 'Accepted. The session is confirmed.'
+        await interaction.followup.send(('⚠️ ' + problem + '\n\n' if problem else '') + private, ephemeral=True)
+        await self.notify(s, f"✅ **{headline}** for {self.when_text(s)}.", self.people(s),
+                          ping_gm=not for_gm, interaction=interaction)
         self.refresh_calendar()
-        await interaction.followup.send(
-            ('⚠️ ' + problem + '\n\n' if problem else '') + self.hub_lines(s, intro=True), ephemeral=True)
 
     async def _do_decline(self, interaction, s):
-        await interaction.response.defer(ephemeral=True, thinking=True)
         if not await asyncio.to_thread(self.store.transition, s['id'], SESSION_OPEN, 'declined'):
-            return await interaction.followup.send('Someone has already dealt with this one.', ephemeral=True)
-        await self.refresh_card(s['id'])
-        s = await asyncio.to_thread(self.store.get_session, s['id'])
-        await self.notify(s, f"❌ **Declined**: {self.when_text(s)}.", [s['proposer_id']])
-        self.refresh_calendar()
+            return await self._out_of_date(interaction, s)
+        s = await self._redraw(interaction, s['id'])
         await interaction.followup.send('Declined.', ephemeral=True)
+        await self.notify(s, f"❌ **Declined**: {self.when_text(s)}.", [s['proposer_id']], interaction=interaction)
+        self.refresh_calendar()
 
     async def _do_withdraw(self, interaction, s):
-        await interaction.response.defer(ephemeral=True, thinking=True)
         if not await asyncio.to_thread(self.store.transition, s['id'], SESSION_OPEN, 'cancelled'):
-            return await interaction.followup.send('Someone has already dealt with this one.', ephemeral=True)
-        await self.refresh_card(s['id'])
-        self.refresh_calendar()
+            return await self._out_of_date(interaction, s)
+        await self._redraw(interaction, s['id'])
         await interaction.followup.send('Withdrawn.', ephemeral=True)
+        self.refresh_calendar()
 
     async def _do_cancel(self, interaction, s):
-        await interaction.response.defer(ephemeral=True, thinking=True)
         if not await asyncio.to_thread(self.store.transition, s['id'], ('confirmed',), 'cancelled'):
-            return await interaction.followup.send('Someone has already dealt with this one.', ephemeral=True)
+            return await self._out_of_date(interaction, s)
+        s = await self._redraw(interaction, s['id'])
         await self.delete_event(s)
-        await self.refresh_card(s['id'])
-        s = await asyncio.to_thread(self.store.get_session, s['id'])
-        await self.notify(s, f"🚫 **Cancelled**: {self.when_text(s)}.", self.people(s))
-        self.refresh_calendar()
         await interaction.followup.send('Cancelled. The Discord event has been removed.', ephemeral=True)
+        await self.notify(s, f"🚫 **Cancelled**: {self.when_text(s)}.", self.people(s), interaction=interaction)
+        self.refresh_calendar()
 
     async def _do_ics(self, interaction, s):
-        if s['status'] != 'confirmed':
-            return await self._say(interaction, 'Only confirmed sessions have a calendar file.')
         ics = self.ics_for(s)
         name = f"session-{s['day']:%Y-%m-%d}.ics"
         await interaction.response.send_message(
@@ -484,24 +508,34 @@ class SessionManager:
             day, start, end = self.parse_when(date_text, time_text)
         except ValueError as e:
             return await self._say(interaction, str(e))
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        if s['status'] == 'confirmed':
-            if not await asyncio.to_thread(self.store.move_session, sid, day, start, end):
-                return await interaction.followup.send("That session isn't confirmed any more.", ephemeral=True)
-            s = await asyncio.to_thread(self.store.get_session, sid)
-            await self.update_event(s)
-            await self.refresh_card(sid)
-            await self.notify(s, f"🕒 **Time changed** to {self.when_text(s)}." +
-                              (f" {discord.utils.escape_mentions(note)}" if note else ''), self.people(s))
+
+        moved = s['status'] == 'confirmed'
+        if moved:
+            ok = await asyncio.to_thread(self.store.move_session, sid, day, start, end)
         else:
-            if not await asyncio.to_thread(self.store.suggest_time, sid, day, start, end, note):
-                return await interaction.followup.send('Someone has already dealt with this one.', ephemeral=True)
+            ok = await asyncio.to_thread(self.store.suggest_time, sid, day, start, end, note)
+        if not ok:
+            return await self._say(interaction, "That session changed while you were typing. Press the button again.")
+
+        # The form was opened from the card, so the card can be redrawn from this submit.
+        if interaction.message is not None:
+            s = await self._redraw(interaction, sid)
+            await interaction.followup.send('Done.', ephemeral=True)
+        else:
+            await interaction.response.defer(ephemeral=True, thinking=True)
             await self.refresh_card(sid)
             s = await asyncio.to_thread(self.store.get_session, sid)
+            await interaction.followup.send('Done.', ephemeral=True)
+
+        if moved:
+            await self.update_event(s)
+            await self.notify(s, f"🕒 **Time changed** to {self.when_text(s)}." +
+                              (f" {discord.utils.escape_mentions(note)}" if note else ''), self.people(s),
+                              interaction=interaction)
+        else:
             await self.notify(s, f"↔️ The GM suggests **{describe_session_time(day, start, end)}** instead.",
-                              [s['proposer_id']])
+                              [s['proposer_id']], interaction=interaction)
         self.refresh_calendar()
-        await interaction.followup.send('Done.', ephemeral=True)
 
     # ---------------------------------------------------------- housekeeping
 

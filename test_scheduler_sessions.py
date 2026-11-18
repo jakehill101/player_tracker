@@ -24,11 +24,15 @@ log = []
 
 class FakeMsg:
     def __init__(s, ch, mid): s.ch, s.id = ch, mid
-    async def edit(s, embed=None, view=None): s.ch.edits.append((s.id, embed, view))
+    async def edit(s, embed=None, view=None):
+        if s.ch.no_access: raise discord.Forbidden(NS(status=403, reason='Missing Access'), {'message': 'Missing Access', 'code': 50001})
+        s.ch.edits.append((s.id, embed, view))
 class FakeChan:
-    def __init__(s, cid): s.id, s.edits, s.sent = cid, [], []
+    def __init__(s, cid): s.id, s.edits, s.sent, s.no_access = cid, [], [], False
     def get_partial_message(s, mid): return FakeMsg(s, mid)
-    async def send(s, content, allowed_mentions=None): s.sent.append((content, allowed_mentions))
+    async def send(s, content, allowed_mentions=None):
+        if s.no_access: raise discord.Forbidden(NS(status=403, reason='Missing Access'), {'message': 'Missing Access', 'code': 50001})
+        s.sent.append((content, allowed_mentions))
 class FakeEvent:
     def __init__(s, eid, kw): s.id, s.kw, s.deleted = eid, kw, False
     async def edit(s, **kw): s.kw.update(kw)
@@ -62,7 +66,7 @@ def member(uid, name, admin=False, role=False):
     return NS(id=uid, display_name=name, guild_permissions=NS(administrator=admin),
               roles=[NS(id=int(GM_ROLE))] if role else [])
 def inter(user, channel_id=55):
-    i = NS(user=user, out=[], guild_id=1, channel=NS(id=channel_id), posted=None)
+    i = NS(user=user, out=[], guild_id=1, channel=NS(id=channel_id), posted=None, message=NS(id=4242))
     i.response, i.followup = Resp(i), Follow(i)
     async def original_response(): return NS(id=4242, channel=NS(id=channel_id))
     i.original_response = original_response
@@ -122,18 +126,22 @@ async def main():
     s = store.get_session(1); assert s['status'] == 'confirmed' and s['event_id']
     ev = bot.guild.events[int(s['event_id'])]
     print('event        :', ev.kw['name'], '|', ev.kw['start_time'].isoformat(), '->', ev.kw['end_time'].isoformat(), '|', ev.kw['location'])
-    hub = i.out[-1][1]; print('GM sees      :', hub.replace('\n', ' / '))
+    kinds = [o[0] for o in i.out]; assert kinds == ['edit', 'follow', 'follow'], kinds    # card, GM-only note, public notice
+    assert i.out[1][2]['ephemeral'] is True and not i.out[2][2].get('ephemeral')
+    hub = i.out[1][1]; print('GM sees      :', hub.replace('\n', ' / '))
     assert 'next-session: 2026-12-12 19:00' in hub and 'seats: 4' in hub and 'signed-up: 2' in hub
-    chan = bot.chans[55]
-    content, am = chan.sent[-1]
+    content, am = i.out[2][1], i.out[2][2]['allowed_mentions']
     print('announcement :', content.replace('\n', ' / '))
     assert [u.id for u in am.users] == [1, 2] and am.everyone is False and not am.roles
-    card_view = chan.edits[-1][2]
+    card_view = i.out[0][2]['view']
     print('confirmed UI :', labels(card_view))
     urls = [c.url for c in card_view.children if getattr(c, 'url', None)]
     assert len(urls) == 2 and all(len(u) <= 512 for u in urls), urls
     # a second click on Approve (stale button) is refused
-    i = await click(mgr, view, gm, 'approve'); assert 'No longer' in str(last(i)) or 'already' in str(last(i)) or 'confirmed' in str(last(i)), last(i)
+    i = await click(mgr, view, gm, 'approve')                                   # an old card, still showing Approve
+    assert 'out of date' in last(i) and 'confirmed' in last(i), last(i)
+    assert 'Cancel session' in labels(next(o for o in i.out if o[0] == 'edit')[2]['view']), 'stale card was not refreshed'
+    assert len(bot.guild.events) == 1                                            # and no second event was made
 
     # --- ics button
     i = await click(mgr, card_view, bea, 'ics')
@@ -148,7 +156,8 @@ async def main():
     m = inter(gm); await mgr.apply_suggestion(m, 1, '13 Dec', '6pm-9pm', 'Bea has an exam')
     s = store.get_session(1); assert s['day'] == date(2026, 12, 13) and s['start_min'] == 18*60
     assert ev.kw['start_time'].hour == 18 and ev.kw['start_time'].day == 13
-    print('time change  :', chan.sent[-1][0].replace('\n', ' / '))
+    print('time change  :', m.out[-1][1].replace('\n', ' / '))
+    assert any(o[0] == 'edit' for o in m.out)                                    # card redrawn from the form submit
 
     # --- a second proposal: GM counters, proposer accepts
     i = inter(bea); await mgr.propose(i, '19 Dec', '2pm', 'Escort the caravan', None)
@@ -161,7 +170,8 @@ async def main():
     i = await click(mgr, v2, sam, 'accept'); assert 'proposed it' in last(i)
     i = await click(mgr, v2, bea, 'accept')
     s2 = store.get_session(2); assert s2['status'] == 'confirmed' and s2['day'] == date(2026, 12, 20) and s2['event_id']
-    print('accepted     :', s2['status'], s2['day'], bot.chans[55].sent[-1][0].split('\n')[0])
+    print('accepted     :', s2['status'], s2['day'], i.out[-1][1].split('\n')[0])
+    assert i.out[-1][2]['allowed_mentions'].roles and i.out[-1][2]['allowed_mentions'].roles[0].id == int(GM_ROLE)
 
     # --- cancel + event removed; non-owners can't
     v2 = (await mgr.render(store.get_session(2)))[1]
@@ -194,9 +204,24 @@ async def main():
     sid = max(x['id'] for x in store.list_sessions(['proposed']))
     v = (await mgr.render(store.get_session(sid)))[1]
     i = await click(mgr, v, gm, 'approve')
-    assert store.get_session(sid)['status'] == 'confirmed' and 'Manage Events' in i.out[-1][1]
+    assert store.get_session(sid)['status'] == 'confirmed' and 'Manage Events' in i.out[1][1]
     bot.guild.fail = None
     print('no event perm: confirmed anyway, GM told to grant Manage Events')
+
+    # --- the reported bug: the bot can't see the channel, yet clicking must still redraw the card
+    bot.get_partial_messageable(55).no_access = True
+    i = inter(member(70, 'Di')); await mgr.propose(i, '23 Dec', '7pm', 'Hidden channel', 3)
+    sid = max(x['id'] for x in store.list_sessions(['proposed']))
+    v = (await mgr.render(store.get_session(sid)))[1]
+    i = await click(mgr, v, gm, 'approve')
+    assert store.get_session(sid)['status'] == 'confirmed'
+    assert 'Cancel session' in labels(i.out[0][2]['view']) and 'Google' in labels(i.out[0][2]['view']), labels(i.out[0][2]['view'])
+    assert 'confirmed' in i.out[-1][1] and i.out[-1][2]['allowed_mentions'].users          # public notice still sent
+    v = i.out[0][2]['view']
+    i = await click(mgr, v, gm, 'cancel')                                        # and cancelling works from that card
+    assert store.get_session(sid)['status'] == 'cancelled' and i.out[0][2]['view'] is None
+    bot.get_partial_messageable(55).no_access = False
+    print('no channel access: card still redraws and cancel works')
 
     # --- calendar + restart + housekeeping
     booked = await mgr.calendar_sessions(date(2026, 12, 1), date(2026, 12, 31))
@@ -213,8 +238,8 @@ async def main():
     # a proposal whose time has passed expires and loses its buttons
     old = store.create_session(5, 'Old', date(2026, 11, 17), 19*60, 22*60, 'too late', 4, 1)
     store.set_message(old, 55, 31337)
-    before = len(bot.chans[55].edits); await mgr.housekeeping()
-    assert store.get_session(old)['status'] == 'expired' and bot.chans[55].edits[-1][2] is None and len(bot.chans[55].edits) > before
+    before = len(bot.get_partial_messageable(55).edits); await mgr.housekeeping()
+    assert store.get_session(old)['status'] == 'expired' and bot.get_partial_messageable(55).edits[-1][2] is None and len(bot.get_partial_messageable(55).edits) > before
     print('restart      : buttons re-attached;  housekeeping: stale proposal expired')
     print('\n✅ All session flows passed (calendar redraws requested:', len(refreshes), ')')
 
