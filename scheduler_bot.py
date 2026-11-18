@@ -55,6 +55,10 @@ DEFAULT_CONFIG = {
     'max_days_ahead': 180,
     'event_location': 'Discord',
     'event_name_prefix': 'Fellgard',
+    'reminder_hours_before': [24, 1],
+    'day_post_time': '09:00',
+    'gm_nudge_time': '09:00',
+    'gm_nudge_after_hours': 24,
 }
 
 
@@ -243,6 +247,8 @@ async def on_ready():
             asyncio.create_task(sessions.sync_google())   # catch up anything missed while the bot was off
     if not session_housekeeping.is_running():
         session_housekeeping.start()
+    if not reminder_loop.is_running():
+        reminder_loop.start()
     if not nightly_backup.is_running():
         nightly_backup.start()
     if not daily_refresh.is_running():
@@ -278,6 +284,17 @@ async def session_housekeeping():
             await sessions.sync_google()    # also retries anything that failed earlier
         except Exception as e:
             print(f'Session housekeeping failed: {e!r}')
+
+
+@tasks.loop(minutes=1)
+async def reminder_loop():
+    """Send any reminders that have come due, and the GM's daily nudge."""
+    if sessions:
+        try:
+            await sessions.send_reminders()
+            await sessions.gm_digest()
+        except Exception as e:
+            print(f'Reminder run failed: {e!r}')
 
 
 @tasks.loop(hours=1)
@@ -618,6 +635,19 @@ async def subscribe(interaction: discord.Interaction):
         view=view, ephemeral=True)
 
 
+@gm.command(name='reminders', description='What reminders are scheduled for upcoming sessions, and what has gone out')
+@is_gm()
+async def gm_reminders(interaction: discord.Interaction):
+    await interaction.response.send_message(await sessions.reminder_overview(), ephemeral=True)
+
+
+@gm.command(name='test_reminder', description='DM yourself a sample reminder to check that DMs reach you')
+@is_gm()
+async def gm_test_reminder(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.followup.send(await sessions.send_test_reminder(interaction.user), ephemeral=True)
+
+
 @gm.command(name='calendar_status', description='Check the shared Google Calendar connection and sync now')
 @is_gm()
 async def gm_calendar_status(interaction: discord.Interaction):
@@ -680,7 +710,9 @@ async def schedule_help(interaction: discord.Interaction):
             '`/gm clear <dates> [time]`: remove your availability\n'
             '`/gm pin_calendar`: post a self-updating calendar in this channel\n'
             '`/gm hub_line`: next session as lines to paste into the hub\n'
-            '`/gm calendar_status`: check the shared Google Calendar and sync now'
+            '`/gm calendar_status`: check the shared Google Calendar and sync now\n'
+            '`/gm reminders`: what reminders are scheduled and what has gone out\n'
+            '`/gm test_reminder`: DM yourself a sample reminder'
         ),
         inline=False,
     )

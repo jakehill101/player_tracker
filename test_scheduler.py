@@ -330,6 +330,55 @@ def test_migration_keeps_existing_data():
     print('✓ Migration from phase 1')
 
 
+def test_migration_v4_to_v5():
+    """Sessions that exist before reminders keep working, and count as confirmed long ago."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'schedule.db')
+        s = ScheduleStore(path)
+        s.close()
+        old = sqlite3.connect(path)
+        old.execute('DROP TABLE reminders_sent')
+        old.execute('ALTER TABLE sessions DROP COLUMN confirmed_at')
+        old.execute('PRAGMA user_version = 4')
+        old.execute("INSERT INTO sessions (status, day, start_min, end_min, goal, party_size, proposer_id, "
+                    "created_at, updated_at) VALUES ('confirmed', '2026-12-12', 1140, 1320, 'kept', 5, '1', 'x', 'x')")
+        old.execute("INSERT INTO session_players VALUES (1, '1', 'Sam', 'x')")
+        old.commit()
+        old.close()
+        s = ScheduleStore(path)
+        assert s.schema_version == len(MIGRATIONS)
+        got = s.get_session(1)
+        assert got['goal'] == 'kept' and got['confirmed_at'] == '' and got['players'] == [('1', 'Sam')]
+        assert os.path.exists(path + '.before-v5')
+        s.record_reminder(1, 'dm24', '1')
+        assert s.reminders_sent_for([1]) == {(1, 'dm24', '1')}
+        s.close()
+    print('✓ Migration to reminders')
+
+
+def test_reminder_store():
+    s = ScheduleStore(':memory:')
+    sid = s.create_session(1, 'Sam', d(12, 12), h(19), h(22), 'goal', 5)
+    assert s.get_session(sid)['confirmed_at'] == ''
+    # Becoming confirmed stamps the time; editing a confirmed session doesn't change it
+    assert s.transition(sid, ('proposed',), 'confirmed')
+    stamp = s.get_session(sid)['confirmed_at']; assert stamp
+    s.transition(sid, ('confirmed',), 'confirmed', event_id='9')
+    assert s.get_session(sid)['confirmed_at'] == stamp
+    # Accepting a suggestion also counts as confirming
+    sid2 = s.create_session(2, 'Bea', d(13, 12), h(19), h(22), 'goal', 5)
+    s.suggest_time(sid2, d(14, 12), h(19), h(22))
+    assert s.accept_suggestion(sid2) and s.get_session(sid2)['confirmed_at']
+    # Recording is once-only and per person; moving the session resets it
+    s.record_reminder(sid, 'dm24', '1'); s.record_reminder(sid, 'dm24', '1'); s.record_reminder(sid, 'dm24', '2')
+    s.record_reminder(sid, 'day', '')
+    assert s.reminders_sent_for([sid, sid2]) == {(sid, 'dm24', '1'), (sid, 'dm24', '2'), (sid, 'day', '')}
+    assert s.reminders_sent_for([]) == set()
+    s.move_session(sid, d(15, 12), h(18), h(21))
+    assert s.reminders_sent_for([sid]) == set()
+    print('✓ Reminder records')
+
+
 def test_settings_and_persistence():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, 'data', 'schedule.db')
@@ -545,6 +594,7 @@ def test_migration_v2_to_v3():
         s = ScheduleStore(path)
         s.close()
         old = sqlite3.connect(path)
+        old.execute('DROP TABLE IF EXISTS reminders_sent')
         old.execute('DROP TABLE session_players')
         old.execute('DROP TABLE sessions')
         old.execute('PRAGMA user_version = 2')
@@ -554,6 +604,7 @@ def test_migration_v2_to_v3():
         s.set_gm_days([d(3, 12)], 'open', [(h(19), 1440)], 'kept')
         s.close()
         old = sqlite3.connect(path)
+        old.execute('DROP TABLE IF EXISTS reminders_sent')
         old.execute('DROP TABLE session_players')
         old.execute('DROP TABLE sessions')
         old.execute('PRAGMA user_version = 2')
@@ -593,6 +644,8 @@ def run_tests():
     test_session_state_machine()
     test_session_race()
     test_migration_v2_to_v3()
+    test_migration_v4_to_v5()
+    test_reminder_store()
     test_settings_and_persistence()
     test_backup_and_prune()
     test_render_month()

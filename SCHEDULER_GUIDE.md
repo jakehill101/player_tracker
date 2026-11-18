@@ -2,7 +2,7 @@
 
 The scheduler bot is the campaign's session calendar: the GM says when they can run, players say when they can play (whole days or just part of a day), and everyone can see it as a month calendar in Discord.
 
-Still to come: reminders.
+
 
 ## Proposing and joining sessions
 
@@ -29,6 +29,26 @@ signed-up: 2
 ```
 
 The hub is still updated by hand; the bot just gives you the text.
+
+## Reminders
+
+The bot reminds people about confirmed sessions so nobody has to remember to look at the calendar.
+
+- **A DM to everyone in the party**, 24 hours and 1 hour before the start. Each says when it starts (in the reader's own time zone), who is in the party and links to the card.
+- **A post in the channel on the morning of the day** (09:00), pinging the party.
+- **A daily nudge to the GM role** (09:00) listing proposals that have been waiting for an answer for a day or more. It only appears if there are some, and only once a day.
+
+How it behaves:
+- Each reminder goes out **once per person**. A restart can't repeat it, and someone who joins late still gets the reminders they haven't had.
+- If a session is **confirmed shortly before** a reminder would go out (for example confirmed 3 hours before the start), the earlier reminder is skipped, since the confirmation just told everyone.
+- If a session is **moved**, its reminders start again for the new time.
+- If the bot was offline at the right moment, it sends the reminder when it comes back, unless something more urgent has taken over.
+- If someone has **DMs closed** to the server's members, their DM is skipped and noted in the bot log (`./logs.sh scheduler`). Players need *Server Settings → Privacy → Allow direct messages from server members* turned on. Nobody else is affected.
+- Only the people in the party are pinged, and the GM role for the nudge. Nothing else the bot posts can ping anyone.
+
+Check it with **`/gm test_reminder`** (DMs you a sample, so you know DMs work) and **`/gm reminders`** (for each coming session: which reminders are pending, due, sent or skipped).
+
+All of it is configurable in `scheduler_config.yaml`: the lead times (`reminder_hours_before`, e.g. `[48, 2]`, or `[]` for no DMs), the morning post time (`day_post_time`, or `""` to turn it off), and the GM nudge (`gm_nudge_time`, `gm_nudge_after_hours`, or `null` to turn it off). A typo in these turns reminders off with a message in the log; it doesn't stop the bot.
 
 ## Shared calendar (Google Calendar)
 
@@ -111,6 +131,8 @@ Uses the same `GM_ROLE_ID` as the other bots (server admins always count).
 | `/gm block <dates> [time] [note]` | When you can't. Blocked time is cut out of any open time |
 | `/gm clear <dates> [time]` | Remove your availability |
 | `/gm calendar_status` | Check the shared Google Calendar connection and sync now |
+| `/gm reminders` | What reminders are scheduled for coming sessions and what has gone out |
+| `/gm test_reminder` | DM yourself a sample reminder, to check DMs reach you |
 | `/gm hub_line` | The next confirmed session as lines to paste into the hub home note |
 | `/gm pin_calendar` | Post this month and next in the current channel and pin them. They redraw themselves whenever anyone changes availability, and just after midnight. Running it again moves the pinned calendar and deletes the old one |
 

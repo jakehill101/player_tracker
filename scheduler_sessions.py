@@ -15,6 +15,9 @@ import discord
 
 import calendar_links as links
 from google_calendar import SyncResult, build_event_body, sync_sessions
+from reminders import (
+    digest_due, due_reminders, parse_hhmm, parse_hours, reminder_plan, waiting_proposals,
+)
 from schedule_dates import parse_dates
 from schedule_store import ProposalLimitError, SESSION_LIVE, SESSION_OPEN, ScheduleStore
 from schedule_times import (
@@ -42,6 +45,15 @@ class SessionManager:
         self._sync_lock = asyncio.Lock()
         self.gm_role_id = int(gm_role_id) if gm_role_id and str(gm_role_id).isdigit() else None
         self.refresh_calendar = refresh_calendar
+        try:
+            self.reminder_hours = parse_hours(config.get('reminder_hours_before'))
+            self.day_post_time = parse_hhmm(config.get('day_post_time'))
+            self.nudge_time = parse_hhmm(config.get('gm_nudge_time'))
+            after = config.get('gm_nudge_after_hours')
+            self.nudge_after = None if after in (None, '', False) else float(after)
+        except (ValueError, TypeError) as e:
+            print(f'Reminders are off because of a problem in scheduler_config.yaml: {e}')
+            self.reminder_hours, self.day_post_time, self.nudge_time, self.nudge_after = [], None, None, None
 
     # ----------------------------------------------------------------- time
 
@@ -266,10 +278,36 @@ class SessionManager:
             if interaction is not None:
                 await interaction.followup.send(content, allowed_mentions=mentions_ok)
             elif s['channel_id']:
-                await self.bot.get_partial_messageable(int(s['channel_id'])).send(
-                    content, allowed_mentions=mentions_ok)
+                await self._channel_send(s['channel_id'], content, users, roles)
         except discord.HTTPException as e:
             print(f'Could not post a notice for session #{s["id"]}: {e.status} {e.text}')
+
+    async def _channel_send(self, channel_id, content: str, users=(), roles=()) -> str:
+        """Post in a channel, pinging only the given users/roles. Returns 'ok', 'denied' (the bot can't
+        post there, so retrying is pointless) or 'retry' (a Discord hiccup)."""
+        if not channel_id:
+            return 'denied'
+        allowed = discord.AllowedMentions(everyone=False, users=list(users), roles=list(roles), replied_user=False)
+        try:
+            await self.bot.get_partial_messageable(int(channel_id)).send(content, allowed_mentions=allowed)
+            return 'ok'
+        except (discord.Forbidden, discord.NotFound):
+            return 'denied'
+        except discord.HTTPException as e:
+            print(f'Channel post failed ({e.status}); will try again.')
+            return 'retry'
+
+    async def _dm(self, user_id: str, text: str) -> str:
+        """Direct message a person. Same return values as _channel_send."""
+        try:
+            user = self.bot.get_user(int(user_id)) or await self.bot.fetch_user(int(user_id))
+            await user.send(text, allowed_mentions=discord.AllowedMentions.none())
+            return 'ok'
+        except (discord.Forbidden, discord.NotFound):
+            return 'denied'
+        except discord.HTTPException as e:
+            print(f'DM failed ({e.status}); will try again.')
+            return 'retry'
 
     def people(self, s: dict) -> List[str]:
         return [uid for uid, _ in s['players']] or [s['proposer_id']]
@@ -565,6 +603,116 @@ class SessionManager:
             await self.notify(s, f"↔️ The GM suggests **{describe_session_time(day, start, end)}** instead.",
                               [s['proposer_id']], interaction=interaction)
         self.refresh_calendar()
+
+    # ------------------------------------------------------------ reminders
+
+    def reminder_text(self, s: dict) -> str:
+        ts = int(self.start_dt(s).timestamp())
+        party = ', '.join(f'<@{uid}>' for uid, _ in s['players'])
+        url = self.jump_url(s)
+        return (f"⏰ **{self.title(s)}** starts <t:{ts}:R>.\n"
+                f"{self.when_text(s)} ({self.tz_label}), which is <t:{ts}:F> where you are.\n"
+                f"Party ({len(s['players'])}/{s['party_size']}): {party}" + (f'\n{url}' if url else ''))
+
+    def day_post_text(self, s: dict) -> str:
+        party = ' '.join(f'<@{uid}>' for uid, _ in s['players'])
+        url = self.jump_url(s)
+        return (f"📅 **Today** at {hhmm(s['start_min'])}: **{self.title(s)}**\n"
+                f"Party ({len(s['players'])}/{s['party_size']}): {party}" + (f'\n{url}' if url else ''))
+
+    async def send_reminders(self):
+        """Send whatever is due. Runs every minute; each reminder goes out once."""
+        if not self.reminder_hours and self.day_post_time is None:
+            return
+        now = self.now()
+        confirmed = await asyncio.to_thread(self.store.list_sessions, ('confirmed',), now.date())
+        if not confirmed:
+            return
+        sent = await asyncio.to_thread(self.store.reminders_sent_for, [s['id'] for s in confirmed])
+        by_id = {s['id']: s for s in confirmed}
+        for d in due_reminders(confirmed, sent, now, self.tz, self.reminder_hours, self.day_post_time):
+            s = by_id[d.session_id]
+            if d.kind == 'day':
+                users = [discord.Object(id=int(uid)) for uid, _ in s['players']]
+                status = await self._channel_send(s['channel_id'], self.day_post_text(s), users)
+            else:
+                status = await self._dm(d.user_id, self.reminder_text(s))
+                await asyncio.sleep(0.3)           # be gentle with Discord's rate limits
+            if status == 'retry':
+                continue                           # try again on the next run
+            await asyncio.to_thread(self.store.record_reminder, d.session_id, d.kind, d.user_id)
+            if status == 'denied':
+                why = ("the bot can't post in that channel" if d.kind == 'day'
+                       else f"user {d.user_id} doesn't accept DMs from this bot")
+                print(f"Reminder {d.kind} for session #{d.session_id} not delivered: {why}. Not retrying.")
+
+    async def gm_digest(self):
+        """Once a day, tell the GM role which proposals have been waiting for an answer."""
+        if self.nudge_after is None or self.nudge_time is None:
+            return
+        now = self.now()
+        last = await asyncio.to_thread(self.store.get_setting, 'gm_digest_date')
+        if not digest_due(now, self.nudge_time, last):
+            return
+        proposals = waiting_proposals(
+            await asyncio.to_thread(self.store.list_sessions, ('proposed',), now.date()), now, self.tz,
+            self.nudge_after)
+        if not proposals:
+            return
+        by_channel: dict = {}
+        for s in proposals:
+            by_channel.setdefault(s['channel_id'], []).append(s)
+        roles = [discord.Object(id=self.gm_role_id)] if self.gm_role_id else []
+        statuses = []
+        for channel_id, items in by_channel.items():
+            lines = []
+            for s in items[:10]:
+                url = self.jump_url(s)
+                lines.append(f"• **{self.when_text(s)}**: {self.title(s)} ({len(s['players'])}/{s['party_size']})"
+                             + (f' <{url}>' if url else ''))
+            head = (f'<@&{self.gm_role_id}> ' if roles else '') + \
+                f"{len(items)} session proposal{'s' if len(items) != 1 else ''} waiting for an answer:"
+            statuses.append(await self._channel_send(channel_id, head + '\n' + '\n'.join(lines), (), roles))
+        if 'retry' not in statuses:        # delivered, or can't be: either way, don't nag again today
+            await asyncio.to_thread(self.store.set_setting, 'gm_digest_date', now.date().isoformat())
+
+    async def reminder_overview(self) -> str:
+        """What is scheduled and what has gone out, for the GM."""
+        now = self.now()
+        confirmed = await asyncio.to_thread(self.store.list_sessions, ('confirmed',), now.date())
+        confirmed = [s for s in confirmed if self.start_dt(s) > now]
+        setup = []
+        if self.reminder_hours:
+            setup.append('DMs ' + ', '.join(f'{h:g}h' for h in self.reminder_hours) + ' before')
+        if self.day_post_time:
+            setup.append(f'channel post at {self.day_post_time:%H:%M} on the day')
+        if self.nudge_after is not None and self.nudge_time:
+            setup.append(f'GM nudge at {self.nudge_time:%H:%M} for proposals waiting {self.nudge_after:g}h+')
+        head = '**Reminders:** ' + (' · '.join(setup) if setup else 'all off')
+        if not confirmed:
+            return head + '\n\nNo confirmed sessions coming up.'
+        sent = await asyncio.to_thread(self.store.reminders_sent_for, [s['id'] for s in confirmed])
+        blocks = []
+        for s in confirmed[:8]:
+            lines = [f"**{self.when_text(s)}**: {self.title(s)} ({len(s['players'])} in the party)"]
+            for label, when, state in reminder_plan(s, sent, now, self.tz, self.reminder_hours, self.day_post_time):
+                lines.append(f"  • {label} ({when:%a %d %b %H:%M}): {state}")
+            blocks.append('\n'.join(lines))
+        return (head + '\n\n' + '\n\n'.join(blocks))[:1900]
+
+    async def send_test_reminder(self, user) -> str:
+        """DM the GM a sample reminder, so they can check DMs reach them."""
+        now = self.now()
+        upcoming = [s for s in await asyncio.to_thread(self.store.list_sessions, ('confirmed',), now.date())
+                    if self.start_dt(s) > now]
+        text = ('🧪 **Test reminder.** This is what players get.\n\n'
+                + (self.reminder_text(upcoming[0]) if upcoming else
+                   '⏰ **Your session** starts in 24 hours. (No confirmed session yet, so this is just a sample.)'))
+        status = await self._dm(str(user.id), text)
+        return {'ok': 'Sent. Check your DMs.',
+                'denied': "I couldn't DM you. In Discord: Server Settings → Privacy → allow direct messages "
+                          "from server members, then try again.",
+                'retry': 'Discord had a hiccup. Try again in a minute.'}[status]
 
     # ---------------------------------------------------------- housekeeping
 

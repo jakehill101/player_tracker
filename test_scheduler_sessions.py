@@ -29,9 +29,11 @@ class FakeMsg:
         if s.ch.no_access: raise discord.Forbidden(NS(status=403, reason='Missing Access'), {'message': 'Missing Access', 'code': 50001})
         s.ch.edits.append((s.id, embed, view))
 class FakeChan:
-    def __init__(s, cid): s.id, s.edits, s.sent, s.no_access = cid, [], [], False
+    def __init__(s, cid): s.id, s.edits, s.sent, s.no_access, s.flaky = cid, [], [], False, 0
     def get_partial_message(s, mid): return FakeMsg(s, mid)
     async def send(s, content, allowed_mentions=None):
+        if s.flaky:
+            s.flaky -= 1; raise discord.HTTPException(NS(status=500, reason='x'), 'boom')
         if s.no_access: raise discord.Forbidden(NS(status=403, reason='Missing Access'), {'message': 'Missing Access', 'code': 50001})
         s.sent.append((content, allowed_mentions))
 class FakeEvent:
@@ -58,8 +60,18 @@ class FakeGCal:
         s.deletes.append(eid)
 
 
+class FakeUser:
+    def __init__(s, uid): s.id, s.dms, s.mode = uid, [], None
+    async def send(s, text, allowed_mentions=None):
+        if s.mode == 'closed': raise discord.Forbidden(NS(status=403, reason='x'), {'message': 'Cannot send messages to this user', 'code': 50007})
+        if s.mode == 'flaky': s.mode = None; raise discord.HTTPException(NS(status=500, reason='x'), 'boom')
+        s.dms.append(text)
+
+
 class FakeBot:
-    def __init__(s): s.chans, s.guild, s.views = {}, FakeGuild(), []
+    def __init__(s): s.chans, s.guild, s.views, s.users = {}, FakeGuild(), [], {}
+    def get_user(s, uid): return None
+    async def fetch_user(s, uid): return s.users.setdefault(uid, FakeUser(uid))
     def get_partial_messageable(s, cid): return s.chans.setdefault(cid, FakeChan(cid))
     def get_guild(s, gid): return s.guild
     def add_view(s, view, message_id=None): s.views.append((message_id, view))
@@ -277,7 +289,132 @@ async def main():
     before = len(bot.get_partial_messageable(55).edits); await mgr.housekeeping()
     assert store.get_session(old)['status'] == 'expired' and bot.get_partial_messageable(55).edits[-1][2] is None and len(bot.get_partial_messageable(55).edits) > before
     print('restart      : buttons re-attached;  housekeeping: stale proposal expired')
+    await reminders_flow()
     print('\n✅ All session flows passed (calendar redraws requested:', len(refreshes), ')')
+
+
+async def reminders_flow():
+    """A confirmed session's reminders over time, and the GM's daily nudge."""
+    from datetime import date
+    store = ScheduleStore(':memory:')
+    bot, clock = FakeBot(), {'t': datetime(2026, 12, 11, 18, 59, tzinfo=TZ)}
+    mgr = SessionManager(bot, store, CFG, TZ, is_gm, GM_ROLE, lambda: None)
+    mgr.now = lambda: clock['t']
+
+    def pin(sid, **cols):      # the real clock isn't pinned, so set the stamps the rules look at
+        store._conn.execute('UPDATE sessions SET ' + ', '.join(f'{k} = ?' for k in cols) + ' WHERE id = ?', (*cols.values(), sid))
+        store._conn.commit()
+
+    sid = store.create_session(1, 'Sam', date(2026, 12, 12), 19 * 60, 22 * 60, 'Clear the cave', 5, guild_id=1)
+    store.join_session(sid, 2, 'Bea'); store.join_session(sid, 3, 'Cass')
+    store.set_message(sid, 55, 4242); store.transition(sid, ('proposed',), 'confirmed')
+    pin(sid, confirmed_at='2026-12-01T10:00:00+00:00')
+    chan = bot.get_partial_messageable(55)
+
+    # 24 hours before: a DM each, once
+    await mgr.send_reminders(); assert not bot.users
+    clock['t'] = datetime(2026, 12, 11, 19, 0, tzinfo=TZ)
+    await mgr.send_reminders()
+    assert sorted(bot.users) == [1, 2, 3] and all(len(u.dms) == 1 for u in bot.users.values())
+    dm = bot.users[2].dms[0]
+    assert 'Clear the cave' in dm and '<t:' in dm and ':R>' in dm and 'Sat 12 Dec, 19:00–22:00 (UK time)' in dm
+    assert 'https://discord.com/channels/1/55/4242' in dm and '<@1>, <@2>, <@3>' in dm
+    await mgr.send_reminders(); await mgr.send_reminders()
+    assert all(len(u.dms) == 1 for u in bot.users.values())                              # never twice
+    print('reminders    : 24h DMs sent once each')
+
+    # the morning of the day: one channel post, pinging the party and nobody else
+    clock['t'] = datetime(2026, 12, 12, 9, 0, tzinfo=TZ)
+    await mgr.send_reminders(); await mgr.send_reminders()
+    assert len(chan.sent) == 1
+    text, am = chan.sent[0]
+    assert text.startswith('📅 **Today** at 19:00: **Clear the cave**') and '<@1> <@2> <@3>' in text
+    assert [u.id for u in am.users] == [1, 2, 3] and am.everyone is False and not am.roles
+    print('reminders    : on-the-day post sent once, pinging only the party')
+
+    # 1 hour before: Cass has DMs closed (skipped, not retried), Bea's DM hits a Discord hiccup (retried)
+    bot.users[3].mode, bot.users[2].mode = 'closed', 'flaky'
+    clock['t'] = datetime(2026, 12, 12, 18, 0, tzinfo=TZ)
+    await mgr.send_reminders()
+    assert len(bot.users[1].dms) == 2 and len(bot.users[2].dms) == 1 and len(bot.users[3].dms) == 1
+    assert (sid, 'dm1', '3') in store.reminders_sent_for([sid]) and (sid, 'dm1', '2') not in store.reminders_sent_for([sid])
+    await mgr.send_reminders()
+    assert len(bot.users[2].dms) == 2 and len(bot.users[1].dms) == 2 and len(bot.users[3].dms) == 1
+    await mgr.send_reminders()
+    assert [len(bot.users[i].dms) for i in (1, 2, 3)] == [2, 2, 1]
+    print('reminders    : closed DMs skipped, a Discord hiccup retried')
+
+    # nothing once it has started
+    clock['t'] = datetime(2026, 12, 12, 19, 30, tzinfo=TZ)
+    await mgr.send_reminders(); assert [len(bot.users[i].dms) for i in (1, 2, 3)] == [2, 2, 1]
+
+    # moving the session resets its reminders, so the new time gets its own
+    store.move_session(sid, date(2026, 12, 14), 18 * 60, 21 * 60)
+    clock['t'] = datetime(2026, 12, 13, 18, 0, tzinfo=TZ)
+    await mgr.send_reminders()
+    assert [len(bot.users[i].dms) for i in (1, 2, 3)] == [3, 3, 1] and 'Mon 14 Dec, 18:00–21:00' in bot.users[1].dms[-1]
+    print('reminders    : moving a session re-schedules them')
+
+    # the day post can fail without a channel: recorded, not retried; a hiccup is retried
+    sid2 = store.create_session(1, 'Sam', date(2026, 12, 20), 19 * 60, 22 * 60, 'Second', 5, guild_id=1)
+    store.set_message(sid2, 66, 1); store.transition(sid2, ('proposed',), 'confirmed')
+    pin(sid2, confirmed_at='2026-12-01T10:00:00+00:00')
+    clock['t'] = datetime(2026, 12, 20, 9, 0, tzinfo=TZ)
+    ch2 = bot.get_partial_messageable(66); ch2.flaky = 1
+    await mgr.send_reminders(); assert not ch2.sent and (sid2, 'day', '') not in store.reminders_sent_for([sid2])
+    await mgr.send_reminders(); assert len(ch2.sent) == 1
+    sid3 = store.create_session(1, 'Sam', date(2026, 12, 21), 19 * 60, 22 * 60, 'Third', 5, guild_id=1)
+    store.set_message(sid3, 77, 1); store.transition(sid3, ('proposed',), 'confirmed')
+    pin(sid3, confirmed_at='2026-12-01T10:00:00+00:00')
+    bot.get_partial_messageable(77).no_access = True
+    clock['t'] = datetime(2026, 12, 21, 9, 0, tzinfo=TZ)
+    await mgr.send_reminders(); await mgr.send_reminders()
+    assert (sid3, 'day', '') in store.reminders_sent_for([sid3]) and not bot.get_partial_messageable(77).sent
+    print('reminders    : channel post: hiccup retried, no access recorded')
+
+    # what the GM sees
+    clock['t'] = datetime(2026, 12, 13, 19, 0, tzinfo=TZ)
+    overview = await mgr.reminder_overview()
+    assert overview.startswith('**Reminders:** DMs 24h, 1h before · channel post at 09:00 on the day · GM nudge at 09:00')
+    assert 'Mon 14 Dec, 18:00–21:00' in overview and 'sent to 3' in overview and 'pending' in overview
+    # a test DM to the GM
+    gm_user = NS(id=99)
+    assert await mgr.send_test_reminder(gm_user) == 'Sent. Check your DMs.' and '🧪 **Test reminder.**' in bot.users[99].dms[0]
+    bot.users[99].mode = 'closed'
+    assert 'allow direct messages' in await mgr.send_test_reminder(gm_user)
+
+    # the GM's daily nudge: only proposals that have waited long enough, once a day
+    p1 = store.create_session(5, 'Eve', date(2026, 12, 18), 19 * 60, 22 * 60, 'Old proposal', 4, guild_id=1)
+    p2 = store.create_session(6, 'Fen', date(2026, 12, 19), 19 * 60, 22 * 60, 'New proposal', 4, guild_id=1)
+    for p in (p1, p2):
+        store.set_message(p, 88, p)
+    pin(p1, created_at='2026-12-12T08:00:00+00:00'); pin(p2, created_at='2026-12-14T08:00:00+00:00')
+    ch88 = bot.get_partial_messageable(88)
+    clock['t'] = datetime(2026, 12, 14, 8, 59, tzinfo=TZ)
+    await mgr.gm_digest(); assert not ch88.sent                                           # before 09:00
+    clock['t'] = datetime(2026, 12, 14, 9, 0, tzinfo=TZ)
+    ch88.flaky = 1
+    await mgr.gm_digest(); assert not ch88.sent                                           # hiccup: not marked as done
+    await mgr.gm_digest()
+    text, am = ch88.sent[0]
+    assert text.startswith(f'<@&{GM_ROLE}> 1 session proposal waiting for an answer:') and 'Old proposal' in text
+    assert 'New proposal' not in text and [r.id for r in am.roles] == [int(GM_ROLE)] and not am.users and am.everyone is False
+    await mgr.gm_digest(); assert len(ch88.sent) == 1                                      # once a day
+    clock['t'] = datetime(2026, 12, 15, 9, 0, tzinfo=TZ)
+    await mgr.gm_digest(); assert len(ch88.sent) == 2 and '2 session proposals' in ch88.sent[1][0]
+    store.transition(p1, ('proposed',), 'declined'); store.transition(p2, ('proposed',), 'declined')
+    clock['t'] = datetime(2026, 12, 16, 9, 0, tzinfo=TZ)
+    await mgr.gm_digest(); assert len(ch88.sent) == 2                                      # nothing waiting: silence
+    print('reminders    : GM nudge once a day, only for proposals that have waited')
+
+    # switching things off in the config
+    off = dict(CFG, reminder_hours_before=[], day_post_time='', gm_nudge_after_hours=None)
+    quiet = SessionManager(FakeBot(), store, off, TZ, is_gm, GM_ROLE, lambda: None)
+    quiet.now = lambda: datetime(2026, 12, 12, 9, 0, tzinfo=TZ)
+    await quiet.send_reminders(); await quiet.gm_digest()
+    assert not quiet.bot.users and 'all off' in await quiet.reminder_overview()
+    bad = SessionManager(FakeBot(), store, dict(CFG, day_post_time='nine'), TZ, is_gm, GM_ROLE, lambda: None)
+    assert bad.reminder_hours == [] and bad.day_post_time is None                           # a typo turns reminders off, not the bot
 
 
 if __name__ == '__main__':
