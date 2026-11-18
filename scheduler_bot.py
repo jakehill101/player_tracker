@@ -21,7 +21,9 @@ try:
 except ImportError:  # Python 3.8
     from backports.zoneinfo import ZoneInfo
 
+from calendar_links import google_subscribe_url, outlook_subscribe_url, webcal_url
 from calendar_render import month_bounds, next_month, render_month
+from google_calendar import CalendarError, GoogleCalendarClient
 from schedule_dates import DateParseError, format_days, parse_dates, parse_month
 from schedule_times import (
     TimeParseError, best_slots, format_windows, gm_calendar_days, group_days_by_windows,
@@ -34,6 +36,10 @@ load_dotenv()
 
 TOKEN = os.getenv('SCHEDULER_BOT_TOKEN')
 GM_ROLE_ID = os.getenv('GM_ROLE_ID')
+# Optional: a dedicated Google Calendar the bot keeps up to date with confirmed sessions
+GOOGLE_CALENDAR_ID = os.getenv('GOOGLE_CALENDAR_ID')
+# Optional: that calendar's "secret address in iCal format", shown to players by /subscribe
+GOOGLE_CALENDAR_ICAL_URL = os.getenv('GOOGLE_CALENDAR_ICAL_URL')
 
 DEFAULT_CONFIG = {
     'timezone': 'Europe/London',
@@ -81,6 +87,18 @@ _refresh_lock = asyncio.Lock()
 
 PIN_CHANNEL_KEY = 'pinned_calendar_channel'
 PIN_MESSAGE_KEY = 'pinned_calendar_message'
+
+
+def build_google_client() -> Optional[GoogleCalendarClient]:
+    if not GOOGLE_CALENDAR_ID:
+        return None
+    try:
+        client = GoogleCalendarClient(GOOGLE_CALENDAR_ID, 'credentials.json')
+    except Exception as e:
+        print(f'Google Calendar sync is off: {e}')
+        return None
+    print(f'Google Calendar sync is on (share the calendar with {client.service_account_email})')
+    return client
 
 
 def today() -> date:
@@ -194,6 +212,8 @@ def schedule_refresh():
         await asyncio.sleep(2)
         _refresh_waiting = False
         await refresh_pinned_calendar()
+        if sessions:
+            await sessions.sync_google()
 
     asyncio.create_task(later())
 
@@ -216,8 +236,11 @@ async def on_ready():
         store = ScheduleStore(config['database'])
         print(f"Schedule database: {config['database']} (schema v{store.schema_version})")
     if sessions is None:
-        sessions = SessionManager(bot, store, config, TZ, user_is_gm, GM_ROLE_ID, schedule_refresh)
+        sessions = SessionManager(bot, store, config, TZ, user_is_gm, GM_ROLE_ID, schedule_refresh,
+                                  gcal=build_google_client())
         await sessions.register_views()
+        if sessions.gcal:
+            asyncio.create_task(sessions.sync_google())   # catch up anything missed while the bot was off
     if not session_housekeeping.is_running():
         session_housekeeping.start()
     if not nightly_backup.is_running():
@@ -252,6 +275,7 @@ async def session_housekeeping():
     if sessions:
         try:
             await sessions.housekeeping()
+            await sessions.sync_google()    # also retries anything that failed earlier
         except Exception as e:
             print(f'Session housekeeping failed: {e!r}')
 
@@ -571,6 +595,54 @@ async def gm_hub_line(interaction: discord.Interaction):
         f"Next: **{sessions.when_text(nxt)}**\n" + sessions.hub_lines(nxt), ephemeral=True)
 
 
+@bot.tree.command(name='subscribe', description='Get every confirmed session in your own calendar app')
+@app_commands.guild_only()
+async def subscribe(interaction: discord.Interaction):
+    url = GOOGLE_CALENDAR_ICAL_URL
+    if not url:
+        await interaction.response.send_message(
+            "The GM hasn't set up the shared calendar yet. You can still add a single session with the "
+            'Google, Outlook and .ics buttons on its card.', ephemeral=True)
+        return
+    view = discord.ui.View()
+    for label, link in (('Google Calendar', google_subscribe_url(url)),
+                        ('Outlook', outlook_subscribe_url(url, config['calendar_title']))):
+        if len(link) <= 512:   # Discord's limit for link buttons
+            view.add_item(discord.ui.Button(label=label, url=link))
+    await interaction.response.send_message(
+        'Subscribe to see every confirmed session in your own calendar. It updates by itself when sessions '
+        'are added, moved or cancelled. Calendar apps refresh subscribed calendars every few hours (Google '
+        'can take up to a day), so for anything urgent trust the Discord card.\n\n'
+        'For Apple Calendar or anything else, copy this address:\n'
+        f'```{webcal_url(url)}```Keep it to the group: anyone with the address can see the sessions.',
+        view=view, ephemeral=True)
+
+
+@gm.command(name='calendar_status', description='Check the shared Google Calendar connection and sync now')
+@is_gm()
+async def gm_calendar_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if not sessions.gcal:
+        await interaction.followup.send(
+            '**Shared calendar: not set up.** Add `GOOGLE_CALENDAR_ID` (and `GOOGLE_CALENDAR_ICAL_URL` for '
+            '`/subscribe`) to `.env` and restart the bot. The steps are in `SCHEDULER_GUIDE.md`.', ephemeral=True)
+        return
+    lines = []
+    try:
+        await asyncio.to_thread(sessions.gcal.check_access)
+        lines.append('✅ I can reach the calendar.')
+        result = await sessions.sync_google()
+        lines.append(f'Synced just now: {result.summary()}.')
+        for err in (result.errors if result else [])[:3]:
+            lines.append(f'⚠️ {err}')
+    except CalendarError as e:
+        lines.append(f'❌ I can\'t use the calendar: {e}')
+    lines.append(f'Service account to share the calendar with: `{sessions.gcal.service_account_email}`')
+    lines.append('`/subscribe` for players: ' + ('✅ ready' if GOOGLE_CALENDAR_ICAL_URL
+                                                  else "❌ add `GOOGLE_CALENDAR_ICAL_URL` to `.env`"))
+    await interaction.followup.send('\n'.join(lines), ephemeral=True)
+
+
 @bot.tree.command(name='schedule_help', description='How the session scheduler works')
 async def schedule_help(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -595,7 +667,8 @@ async def schedule_help(interaction: discord.Interaction):
             '`/calendar [month]`: month view\n'
             '`/whosfree <date>`: who can play on a date, and when\n'
             '`/propose <date> <time> <goal> [party_size]`: suggest a session; the GM approves it\n'
-            '`/sessions`: what is planned'
+            '`/sessions`: what is planned\n'
+            '`/subscribe`: get every confirmed session in your own calendar app'
         ),
         inline=False,
     )
@@ -606,7 +679,8 @@ async def schedule_help(interaction: discord.Interaction):
             "`/gm block <dates> [time] [note]`: when you can't\n"
             '`/gm clear <dates> [time]`: remove your availability\n'
             '`/gm pin_calendar`: post a self-updating calendar in this channel\n'
-            '`/gm hub_line`: next session as lines to paste into the hub'
+            '`/gm hub_line`: next session as lines to paste into the hub\n'
+            '`/gm calendar_status`: check the shared Google Calendar and sync now'
         ),
         inline=False,
     )

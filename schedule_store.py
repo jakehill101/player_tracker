@@ -122,6 +122,10 @@ MIGRATIONS = [
         PRIMARY KEY (session_id, user_id)
     );
     """,
+    # 4: remember what was last pushed to the shared Google Calendar ('' = never, 'deleted' = removed)
+    """
+    ALTER TABLE sessions ADD COLUMN gcal_hash TEXT NOT NULL DEFAULT '';
+    """,
 ]
 
 NOTE_MAX = 100
@@ -477,6 +481,10 @@ class ScheduleStore:
         """Change the time of a confirmed session."""
         self._check_windows([(start_min, end_min)])
         return self.transition(sid, ('confirmed',), 'confirmed', day=day, start_min=start_min, end_min=end_min)
+
+    def set_gcal_hash(self, sid: int, digest: str):
+        with self._lock, self._conn:
+            self._conn.execute('UPDATE sessions SET gcal_hash = ? WHERE id = ?', (digest, sid))
 
     def close_finished(self, today_: date, now_min: int) -> List[Tuple[int, str]]:
         """Open proposals whose start has passed become 'expired'; confirmed sessions whose end

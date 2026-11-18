@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import discord
 from schedule_store import ScheduleStore
 from scheduler_sessions import SessionManager
+from google_calendar import CalendarError
 import yaml
 
 with open('scheduler_config.yaml') as f:
@@ -43,6 +44,20 @@ class FakeGuild:
         if s.fail: raise s.fail
         e = FakeEvent(9000 + len(s.events), kw); s.events[e.id] = e; return e
     async def fetch_scheduled_event(s, eid): return s.events[eid]
+class FakeGCal:
+    """Stands in for the Google Calendar client."""
+    service_account_email = 'bot@proj.iam.gserviceaccount.com'
+
+    def __init__(s): s.upserts, s.deletes, s.fail = [], [], None
+    def check_access(s): pass
+    def upsert_event(s, eid, body):
+        if s.fail: raise s.fail
+        s.upserts.append((eid, body))
+    def delete_event(s, eid):
+        if s.fail: raise s.fail
+        s.deletes.append(eid)
+
+
 class FakeBot:
     def __init__(s): s.chans, s.guild, s.views = {}, FakeGuild(), []
     def get_partial_messageable(s, cid): return s.chans.setdefault(cid, FakeChan(cid))
@@ -87,8 +102,8 @@ def field(embed, name): return next((f.value for f in embed.fields if f.name.sta
 async def main():
     tmp = tempfile.mkdtemp()
     store = ScheduleStore(os.path.join(tmp, 's.db'))
-    bot = FakeBot(); refreshes = []
-    mgr = SessionManager(bot, store, CFG, TZ, is_gm, GM_ROLE, lambda: refreshes.append(1))
+    bot = FakeBot(); refreshes = []; gcal = FakeGCal()
+    mgr = SessionManager(bot, store, CFG, TZ, is_gm, GM_ROLE, lambda: refreshes.append(1), gcal=gcal)
     mgr.now = lambda: NOW
     sam, bea, gm = member(1, 'Sam'), member(2, 'Bea'), member(99, 'GM', role=True)
 
@@ -182,6 +197,17 @@ async def main():
     i = await click(mgr, v2, bea, 'join'); assert 'cancelled' in last(i)
     print('cancelled    : event deleted, buttons gone')
 
+    # --- shared Google Calendar: only confirmed sessions, no names, one event each
+    res = await mgr.sync_google()
+    assert res.ok and [eid for eid, _ in gcal.upserts] == ['fellgardsession1'] and not gcal.deletes   # #2 was cancelled before it was ever pushed
+    g = gcal.upserts[0][1]
+    assert g['summary'] == 'Fellgard: Clear the cave' and g['start']['dateTime'].startswith('2026-12-13T18:00')
+    assert 'https://discord.com/channels/1/55/4242' in g['description']
+    assert not any(n in str(g) for n in ('Sam', 'Bea', '<@')), g
+    assert store.get_setting('gcal_last_error') is None and store.get_setting('gcal_last_sync')
+    await mgr.sync_google(); assert len(gcal.upserts) == 1                                          # unchanged: nothing re-sent
+    print('shared cal   : 1 event pushed, no player names, nothing re-sent')
+
     # --- limits and bad input
     for n in range(4):
         i = inter(sam); await mgr.propose(i, f'{14+n} Dec', '7pm', f'goal {n}', 3); assert (n < 3) == ('already have' not in str(last(i))), (n, last(i))
@@ -208,6 +234,14 @@ async def main():
     bot.guild.fail = None
     print('no event perm: confirmed anyway, GM told to grant Manage Events')
 
+    gcal.fail = CalendarError(403, 'not shared')                                                     # Google refuses
+    res = await mgr.sync_google()
+    assert not res.ok and '403' in store.get_setting('gcal_last_error') and store.get_session(sid)['gcal_hash'] == ''
+    gcal.fail = None                                                                                  # fixed: the next sync catches up
+    res = await mgr.sync_google()
+    assert res.ok and res.pushed == 1 and store.get_setting('gcal_last_error') is None and gcal.upserts[-1][0] == f'fellgardsession{sid}'
+    print('shared cal   : outage recorded, then caught up on the next sync')
+
     # --- the reported bug: the bot can't see the channel, yet clicking must still redraw the card
     bot.get_partial_messageable(55).no_access = True
     i = inter(member(70, 'Di')); await mgr.propose(i, '23 Dec', '7pm', 'Hidden channel', 3)
@@ -217,9 +251,11 @@ async def main():
     assert store.get_session(sid)['status'] == 'confirmed'
     assert 'Cancel session' in labels(i.out[0][2]['view']) and 'Google' in labels(i.out[0][2]['view']), labels(i.out[0][2]['view'])
     assert 'confirmed' in i.out[-1][1] and i.out[-1][2]['allowed_mentions'].users          # public notice still sent
+    await mgr.sync_google(); assert gcal.upserts[-1][0] == f'fellgardsession{sid}'
     v = i.out[0][2]['view']
     i = await click(mgr, v, gm, 'cancel')                                        # and cancelling works from that card
     assert store.get_session(sid)['status'] == 'cancelled' and i.out[0][2]['view'] is None
+    await mgr.sync_google(); assert gcal.deletes[-1] == f'fellgardsession{sid}'                   # cancelled: removed from the shared calendar
     bot.get_partial_messageable(55).no_access = False
     print('no channel access: card still redraws and cancel works')
 

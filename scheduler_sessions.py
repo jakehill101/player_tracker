@@ -14,6 +14,7 @@ from typing import Callable, Iterable, List, Optional
 import discord
 
 import calendar_links as links
+from google_calendar import SyncResult, build_event_body, sync_sessions
 from schedule_dates import parse_dates
 from schedule_store import ProposalLimitError, SESSION_LIVE, SESSION_OPEN, ScheduleStore
 from schedule_times import (
@@ -34,9 +35,11 @@ STATUS_LOOK = {
 
 class SessionManager:
     def __init__(self, bot, store: ScheduleStore, config: dict, tz, is_gm: Callable, gm_role_id: Optional[str],
-                 refresh_calendar: Callable[[], None]):
+                 refresh_calendar: Callable[[], None], gcal=None):
         self.bot, self.store, self.config, self.tz = bot, store, config, tz
         self.is_gm = is_gm
+        self.gcal = gcal                      # GoogleCalendarClient, or None if not set up
+        self._sync_lock = asyncio.Lock()
         self.gm_role_id = int(gm_role_id) if gm_role_id and str(gm_role_id).isdigit() else None
         self.refresh_calendar = refresh_calendar
 
@@ -145,6 +148,32 @@ class SessionManager:
 
     def event_title(self, s: dict) -> str:
         return f"{self.config['event_name_prefix']}: {s['goal']}"[:100]
+
+    def google_body(self, s: dict) -> dict:
+        """The event on the shared calendar: title, time, goal and a Discord link. No player names."""
+        url = self.jump_url(s)
+        description = s['goal'] + (f'\nDetails and sign-up: {url}' if url else '')
+        return build_event_body(self.event_title(s), description, self.config['event_location'],
+                                self.start_dt(s), self.end_dt(s), getattr(self.tz, 'key', str(self.tz)))
+
+    async def sync_google(self) -> Optional[SyncResult]:
+        """Bring the shared Google Calendar in line with the confirmed sessions. Safe to call often."""
+        if not self.gcal:
+            return None
+        async with self._sync_lock:
+            try:
+                result = await asyncio.to_thread(sync_sessions, self.store, self.gcal, self.now().date(),
+                                                 self.google_body)
+            except Exception as e:
+                result = SyncResult(errors=[f'{type(e).__name__}: {e}'])
+            await asyncio.to_thread(self.store.set_setting, 'gcal_last_sync', self.now().isoformat(timespec='seconds'))
+            await asyncio.to_thread(self.store.set_setting, 'gcal_last_error',
+                                    '; '.join(result.errors)[:500] if result.errors else None)
+            if result.errors:
+                print(f'Google Calendar sync: {result.summary()}. {result.errors[0]}')
+            elif result.pushed or result.deleted:
+                print(f'Google Calendar sync: {result.summary()}')
+            return result
 
     def event_details(self, s: dict) -> str:
         names = ', '.join(name for _, name in s['players'])
