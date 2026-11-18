@@ -2,7 +2,7 @@
 
 The scheduler bot is the campaign's session calendar: the GM says when they can run, players say when they can play (whole days or just part of a day), and everyone can see it as a month calendar in Discord.
 
-Still to come: a subscribable Google Calendar of confirmed sessions, and reminders.
+Still to come: reminders.
 
 ## Proposing and joining sessions
 
@@ -29,6 +29,29 @@ signed-up: 2
 ```
 
 The hub is still updated by hand; the bot just gives you the text.
+
+## Shared calendar (Google Calendar)
+
+Confirmed sessions are also written to a dedicated Google Calendar, so players can subscribe once and see every session in their own calendar app (Google, Outlook or Apple). It is optional: leave the two settings blank and everything else works as before.
+
+What goes on it: the title ("Fellgard: Clear the goblin cave"), the time, the goal and a link back to the Discord card. **No player names.** Proposals never appear on it, only confirmed sessions. If a session is moved, the calendar entry moves; if it is cancelled, the entry is removed. The bot keeps checking, so if Google was unreachable it catches up by itself within about 10 minutes.
+
+**Setting it up** (once, about ten minutes, using the same Google account and service account as the Sheet):
+
+1. **Turn on the API.** In the [Google Cloud Console](https://console.cloud.google.com/), pick the project your Sheet credentials belong to, then *APIs & Services → Library → Google Calendar API → Enable*.
+2. **Make a calendar.** In [Google Calendar](https://calendar.google.com/), *Other calendars → + → Create new calendar*. Call it something like "Tales from Fellgard · sessions".
+3. **Share it with the bot.** Open that calendar's *Settings and sharing → Share with specific people → Add people* and enter the service account's address (the `client_email` in `credentials.json`; `/gm calendar_status` also prints it). Give it **Make changes to events**.
+4. **Copy two things from the same settings page**, under *Integrate calendar*:
+   - **Calendar ID** → `GOOGLE_CALENDAR_ID` in `.env`
+   - **Secret address in iCal format** → `GOOGLE_CALENDAR_ICAL_URL` in `.env`
+5. **Restart** the bot (`sudo systemctl restart scheduler_bot`) and run **`/gm calendar_status`**. You should see "✅ I can reach the calendar" and any confirmed sessions are added straight away. If it says ❌, the message says what to fix (usually the sharing step or the API switch).
+
+**Players** run **`/subscribe`**, which gives them one-click buttons for Google Calendar and Outlook, and an address for Apple Calendar. Calendar apps refresh subscribed calendars every few hours (Google can take up to a day), so a change shows up on the Discord card first and in people's calendars a little later. The buttons on each card still add just that one session straight away.
+
+Things to know:
+- The secret address lets anyone who has it see the sessions, so share it only with the group (`/subscribe` shows it privately). If it leaks, *Integrate calendar → Reset* in Google Calendar gives a new one; update `GOOGLE_CALENDAR_ICAL_URL` and restart.
+- Keep the calendar for the bot's use. If you delete or edit one of its events by hand, the bot won't fix it until that session changes again.
+- Sessions older than a month are left alone.
 
 ## Typing dates
 
@@ -74,6 +97,7 @@ Times are in the campaign timezone (UK time by default). A bare number like `7-1
 | `/calendar [month] [private]` | Month view as an image. `month` can be `January`, `next` or `2027-01` |
 | `/propose <date> <time> <goal> [party_size]` | Propose a session for the GM to approve |
 | `/sessions [private]` | What's coming up, with links |
+| `/subscribe` | Add every confirmed session to your own calendar app |
 | `/whosfree <date>` | GM status, who is free or busy, and **when the GM and players overlap**, with the most people first |
 | `/schedule_help` | Short help |
 
@@ -86,6 +110,7 @@ Uses the same `GM_ROLE_ID` as the other bots (server admins always count).
 | `/gm open <dates> [time] [note]` | When you can run. The note (e.g. "at the inn") shows on the calendar |
 | `/gm block <dates> [time] [note]` | When you can't. Blocked time is cut out of any open time |
 | `/gm clear <dates> [time]` | Remove your availability |
+| `/gm calendar_status` | Check the shared Google Calendar connection and sync now |
 | `/gm hub_line` | The next confirmed session as lines to paste into the hub home note |
 | `/gm pin_calendar` | Post this month and next in the current channel and pin them. They redraw themselves whenever anyone changes availability, and just after midnight. Running it again moves the pinned calendar and deletes the old one |
 

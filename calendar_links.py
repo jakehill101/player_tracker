@@ -109,3 +109,21 @@ def outlook_url(title: str, start: datetime, end: datetime, details: str = '', l
     params = {'path': '/calendar/action/compose', 'rru': 'addevent', 'subject': title,
               'startdt': iso(start), 'enddt': iso(end), 'body': details, 'location': location}
     return _fit_url('https://outlook.live.com/calendar/0/deeplink/compose', params, ['body', 'location'])
+
+
+def webcal_url(ical_url: str) -> str:
+    """The same feed with the webcal:// scheme, which Apple Calendar and others open directly."""
+    for prefix in ('https://', 'http://'):
+        if ical_url.startswith(prefix):
+            return 'webcal://' + ical_url[len(prefix):]
+    return ical_url
+
+
+def google_subscribe_url(ical_url: str) -> str:
+    """Opens Google Calendar's 'add calendar from URL' with the feed filled in."""
+    return 'https://calendar.google.com/calendar/r?' + urlencode({'cid': webcal_url(ical_url)})
+
+
+def outlook_subscribe_url(ical_url: str, name: str = 'Sessions') -> str:
+    """Opens Outlook's 'subscribe from web' with the feed filled in."""
+    return 'https://outlook.live.com/calendar/0/addfromweb?' + urlencode({'url': ical_url, 'name': name})
