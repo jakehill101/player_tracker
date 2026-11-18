@@ -126,6 +126,18 @@ MIGRATIONS = [
     """
     ALTER TABLE sessions ADD COLUMN gcal_hash TEXT NOT NULL DEFAULT '';
     """,
+    # 5: reminders. confirmed_at ('' for older rows) lets us skip a reminder that the confirmation
+    # itself just made redundant; reminders_sent makes every reminder once-only, per person.
+    """
+    ALTER TABLE sessions ADD COLUMN confirmed_at TEXT NOT NULL DEFAULT '';
+    CREATE TABLE reminders_sent (
+        session_id INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+        kind       TEXT NOT NULL,
+        user_id    TEXT NOT NULL DEFAULT '',
+        sent_at    TEXT NOT NULL,
+        PRIMARY KEY (session_id, kind, user_id)
+    );
+    """,
 ]
 
 NOTE_MAX = 100
@@ -454,13 +466,18 @@ class ScheduleStore:
         if bad:
             raise ValueError(f'cannot set {sorted(bad)}')
         from_statuses = list(from_statuses)
-        sets = ', '.join(f'{k} = ?' for k in fields)
-        sql = (f'UPDATE sessions SET status = ?, updated_at = ?{", " + sets if sets else ""} '
+        now = _now()
+        assignments, values = ['status = ?', 'updated_at = ?'], [to_status, now]
+        if to_status == 'confirmed' and 'confirmed' not in from_statuses:
+            assignments.append('confirmed_at = ?')      # becoming confirmed, not just being edited
+            values.append(now)
+        for k, v in fields.items():
+            assignments.append(f'{k} = ?')
+            values.append(v.isoformat() if isinstance(v, date) else v)
+        sql = (f'UPDATE sessions SET {", ".join(assignments)} '
                f'WHERE id = ? AND status IN ({",".join("?" * len(from_statuses))})')
-        params = [to_status, _now(), *[v.isoformat() if isinstance(v, date) else v for v in fields.values()],
-                  sid, *from_statuses]
         with self._lock, self._conn:
-            return self._conn.execute(sql, params).rowcount == 1
+            return self._conn.execute(sql, [*values, sid, *from_statuses]).rowcount == 1
 
     def suggest_time(self, sid: int, day: date, start_min: int, end_min: int, note: str = '') -> bool:
         """GM counter-offer on an open proposal."""
@@ -474,13 +491,38 @@ class ScheduleStore:
             return self._conn.execute(
                 "UPDATE sessions SET status = 'confirmed', day = sug_day, start_min = sug_start_min, "
                 "end_min = sug_end_min, sug_day = NULL, sug_start_min = NULL, sug_end_min = NULL, "
-                "sug_note = '', updated_at = ? WHERE id = ? AND status = 'countered' AND sug_day IS NOT NULL",
-                (_now(), sid)).rowcount == 1
+                "sug_note = '', updated_at = ?, confirmed_at = ? "
+                "WHERE id = ? AND status = 'countered' AND sug_day IS NOT NULL",
+                (_now(), _now(), sid)).rowcount == 1
 
     def move_session(self, sid: int, day: date, start_min: int, end_min: int) -> bool:
         """Change the time of a confirmed session."""
         self._check_windows([(start_min, end_min)])
-        return self.transition(sid, ('confirmed',), 'confirmed', day=day, start_min=start_min, end_min=end_min)
+        moved = self.transition(sid, ('confirmed',), 'confirmed', day=day, start_min=start_min, end_min=end_min)
+        if moved:
+            self.clear_reminders(sid)      # the new time gets its own reminders
+        return moved
+
+    def reminders_sent_for(self, session_ids: Iterable[int]) -> set:
+        """{(session_id, kind, user_id)} already sent for these sessions."""
+        ids = list(session_ids)
+        if not ids:
+            return set()
+        with self._lock:
+            rows = self._conn.execute(
+                f'SELECT session_id, kind, user_id FROM reminders_sent WHERE session_id IN ({",".join("?" * len(ids))})',
+                ids).fetchall()
+        return {(r['session_id'], r['kind'], r['user_id']) for r in rows}
+
+    def record_reminder(self, session_id: int, kind: str, user_id: str = ''):
+        with self._lock, self._conn:
+            self._conn.execute(
+                'INSERT OR IGNORE INTO reminders_sent (session_id, kind, user_id, sent_at) VALUES (?, ?, ?, ?)',
+                (session_id, kind, str(user_id), _now()))
+
+    def clear_reminders(self, session_id: int):
+        with self._lock, self._conn:
+            self._conn.execute('DELETE FROM reminders_sent WHERE session_id = ?', (session_id,))
 
     def set_gcal_hash(self, sid: int, digest: str):
         with self._lock, self._conn:

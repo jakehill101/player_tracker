@@ -37,3 +37,18 @@ event_location: "Discord"
 
 # Discord event names look like "Fellgard: Clear the goblin cave"
 event_name_prefix: "Fellgard"
+
+# --- Reminders ---
+
+# Direct message each person in a confirmed session this many hours before it starts.
+# The longest comes first in practice; [] turns DM reminders off.
+reminder_hours_before: [24, 1]
+
+# On the morning of a session, post in the channel and ping the party. "" turns it off.
+day_post_time: "09:00"
+
+# Once a day at this time, tell the GM role about proposals that have been waiting for an answer.
+gm_nudge_time: "09:00"
+
+# ...but only ones that have been waiting at least this many hours. Set to null to turn the nudge off.
+gm_nudge_after_hours: 24
