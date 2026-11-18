@@ -186,18 +186,9 @@ async def refresh_pinned_calendar():
             await render_month_file(y2, m2, 'calendar-next-month.png'),
         ]
         try:
-            await message.edit(content=pinned_text(), attachments=files)
+            await message.edit(content=None, attachments=files)     # images only; None also clears any old text
         except discord.HTTPException as e:
             print(f'Could not update pinned calendar: {e}')
-
-
-def pinned_text() -> str:
-    stamp = int(datetime.now(TZ).timestamp())
-    return (
-        '**Session calendar**: this month and next. An amber badge shows when the GM is free.\n'
-        'Add your own availability with `/available` and `/unavailable`, and propose a session with `/propose`. '
-        f'`/calendar` shows any month.\n-# Updated <t:{stamp}:R>'
-    )
 
 
 _refresh_waiting = False
@@ -384,7 +375,7 @@ async def gm_pin_calendar(interaction: discord.Interaction):
         await render_month_file(y2, m2, 'calendar-next-month.png'),
     ]
     try:
-        message = await channel.send(content=pinned_text(), files=files)
+        message = await channel.send(files=files)
     except discord.Forbidden:
         await interaction.followup.send("I can't post in this channel.", ephemeral=True)
         return
