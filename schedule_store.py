@@ -19,6 +19,17 @@ from schedule_times import DAY, Window, merge, subtract
 
 GM_STATES = ('open', 'blocked')
 PLAYER_STATES = ('free', 'busy')
+SESSION_LIVE = ('proposed', 'countered', 'confirmed')
+SESSION_OPEN = ('proposed', 'countered')   # waiting on the GM or the proposer
+GOAL_MAX = 100
+
+
+class ProposalLimitError(Exception):
+    """The proposer already has the maximum number of open proposals."""
+
+    def __init__(self, limit: int):
+        super().__init__(f'limit {limit}')
+        self.limit = limit
 
 # Each entry upgrades the schema by one version. Append only; never edit a
 # migration that has shipped.
@@ -77,6 +88,39 @@ MIGRATIONS = [
     DROP TABLE player_availability;
     ALTER TABLE player_availability_v2 RENAME TO player_availability;
     CREATE INDEX player_availability_day ON player_availability (day);
+    """,
+    # 3: sessions (proposals and confirmed sessions)
+    """
+    CREATE TABLE sessions (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        status        TEXT NOT NULL CHECK (status IN
+                      ('proposed', 'countered', 'confirmed', 'declined', 'cancelled', 'expired', 'done')),
+        day           TEXT NOT NULL,
+        start_min     INTEGER NOT NULL CHECK (start_min >= 0 AND start_min < 1440),
+        end_min       INTEGER NOT NULL CHECK (end_min > start_min AND end_min <= 1440),
+        goal          TEXT NOT NULL,
+        party_size    INTEGER NOT NULL CHECK (party_size >= 1),
+        proposer_id   TEXT NOT NULL,
+        proposer_name TEXT NOT NULL DEFAULT '',
+        guild_id      TEXT NOT NULL DEFAULT '',
+        channel_id    TEXT NOT NULL DEFAULT '',
+        message_id    TEXT NOT NULL DEFAULT '',
+        event_id      TEXT NOT NULL DEFAULT '',
+        sug_day       TEXT,
+        sug_start_min INTEGER,
+        sug_end_min   INTEGER,
+        sug_note      TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    );
+    CREATE INDEX sessions_status_day ON sessions (status, day);
+    CREATE TABLE session_players (
+        session_id   INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+        user_id      TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        joined_at    TEXT NOT NULL,
+        PRIMARY KEY (session_id, user_id)
+    );
     """,
 ]
 
@@ -300,6 +344,156 @@ class ScheduleStore:
         for r in rows:
             out[date.fromisoformat(r['day'])].append((r['state'], r['start_min'], r['end_min']))
         return dict(out)
+
+    # ------------------------------------------------------------ sessions
+
+    # Columns callers may change through transition(); everything else has its own method.
+    _SESSION_FIELDS = {'day', 'start_min', 'end_min', 'goal', 'party_size', 'event_id',
+                       'sug_day', 'sug_start_min', 'sug_end_min', 'sug_note'}
+
+    def _session(self, row) -> dict:
+        s = {k: row[k] for k in row.keys()}
+        s['day'] = date.fromisoformat(s['day'])
+        s['sug_day'] = date.fromisoformat(s['sug_day']) if s['sug_day'] else None
+        s['players'] = [
+            (r['user_id'], r['display_name'])
+            for r in self._conn.execute(
+                'SELECT user_id, display_name FROM session_players WHERE session_id = ? '
+                'ORDER BY joined_at, rowid', (s['id'],))
+        ]
+        return s
+
+    def create_session(self, proposer_id, proposer_name: str, day: date, start_min: int, end_min: int,
+                       goal: str, party_size: int, guild_id='', max_open: int = 3) -> int:
+        """Create a proposal and join the proposer to it. Raises ProposalLimitError."""
+        proposer_id = str(proposer_id)
+        name = _clean(proposer_name, NAME_MAX)
+        goal = _clean(goal, GOAL_MAX)
+        if not goal:
+            raise ValueError('a goal is needed')
+        self._check_windows([(start_min, end_min)])
+        now = _now()
+        with self._lock, self._conn:
+            open_now = self._conn.execute(
+                'SELECT COUNT(*) FROM sessions WHERE proposer_id = ? AND status IN (?, ?)',
+                (proposer_id, *SESSION_OPEN)).fetchone()[0]
+            if open_now >= max_open:
+                raise ProposalLimitError(max_open)
+            cur = self._conn.execute(
+                'INSERT INTO sessions (status, day, start_min, end_min, goal, party_size, proposer_id, '
+                'proposer_name, guild_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                ('proposed', day.isoformat(), start_min, end_min, goal, int(party_size), proposer_id,
+                 name, str(guild_id), now, now))
+            sid = cur.lastrowid
+            self._conn.execute(
+                'INSERT INTO session_players (session_id, user_id, display_name, joined_at) VALUES (?, ?, ?, ?)',
+                (sid, proposer_id, name, now))
+        return sid
+
+    def get_session(self, sid: int) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute('SELECT * FROM sessions WHERE id = ?', (sid,)).fetchone()
+            return self._session(row) if row else None
+
+    def list_sessions(self, statuses: Iterable[str], start: Optional[date] = None,
+                      end: Optional[date] = None) -> List[dict]:
+        statuses = list(statuses)
+        sql = f'SELECT * FROM sessions WHERE status IN ({",".join("?" * len(statuses))})'
+        params: list = list(statuses)
+        if start:
+            sql += ' AND day >= ?'
+            params.append(start.isoformat())
+        if end:
+            sql += ' AND day <= ?'
+            params.append(end.isoformat())
+        with self._lock:
+            rows = self._conn.execute(sql + ' ORDER BY day, start_min, id', params).fetchall()
+            return [self._session(r) for r in rows]
+
+    def set_message(self, sid: int, channel_id, message_id):
+        with self._lock, self._conn:
+            self._conn.execute('UPDATE sessions SET channel_id = ?, message_id = ?, updated_at = ? WHERE id = ?',
+                               (str(channel_id), str(message_id), _now(), sid))
+
+    def join_session(self, sid: int, user_id, name: str) -> str:
+        """'joined', 'already' (name refreshed) or 'closed'."""
+        user_id, name = str(user_id), _clean(name, NAME_MAX)
+        with self._lock, self._conn:
+            row = self._conn.execute('SELECT status FROM sessions WHERE id = ?', (sid,)).fetchone()
+            if not row or row['status'] not in SESSION_LIVE:
+                return 'closed'
+            cur = self._conn.execute(
+                'INSERT OR IGNORE INTO session_players (session_id, user_id, display_name, joined_at) '
+                'VALUES (?, ?, ?, ?)', (sid, user_id, name, _now()))
+            if cur.rowcount == 0:
+                self._conn.execute('UPDATE session_players SET display_name = ? WHERE session_id = ? AND user_id = ?',
+                                   (name, sid, user_id))
+                return 'already'
+            return 'joined'
+
+    def leave_session(self, sid: int, user_id) -> str:
+        """'left', 'not_in' or 'closed'."""
+        with self._lock, self._conn:
+            row = self._conn.execute('SELECT status FROM sessions WHERE id = ?', (sid,)).fetchone()
+            if not row or row['status'] not in SESSION_LIVE:
+                return 'closed'
+            cur = self._conn.execute('DELETE FROM session_players WHERE session_id = ? AND user_id = ?',
+                                     (sid, str(user_id)))
+            return 'left' if cur.rowcount else 'not_in'
+
+    def transition(self, sid: int, from_statuses: Iterable[str], to_status: str, **fields) -> bool:
+        """Move a session to a new status only if it is currently in `from_statuses`.
+
+        Returns False if it wasn't, so two people clicking Approve at once can't both win.
+        """
+        bad = set(fields) - self._SESSION_FIELDS
+        if bad:
+            raise ValueError(f'cannot set {sorted(bad)}')
+        from_statuses = list(from_statuses)
+        sets = ', '.join(f'{k} = ?' for k in fields)
+        sql = (f'UPDATE sessions SET status = ?, updated_at = ?{", " + sets if sets else ""} '
+               f'WHERE id = ? AND status IN ({",".join("?" * len(from_statuses))})')
+        params = [to_status, _now(), *[v.isoformat() if isinstance(v, date) else v for v in fields.values()],
+                  sid, *from_statuses]
+        with self._lock, self._conn:
+            return self._conn.execute(sql, params).rowcount == 1
+
+    def suggest_time(self, sid: int, day: date, start_min: int, end_min: int, note: str = '') -> bool:
+        """GM counter-offer on an open proposal."""
+        self._check_windows([(start_min, end_min)])
+        return self.transition(sid, SESSION_OPEN, 'countered', sug_day=day, sug_start_min=start_min,
+                               sug_end_min=end_min, sug_note=_clean(note, 150))
+
+    def accept_suggestion(self, sid: int) -> bool:
+        """The suggested time becomes the session time and the session is confirmed."""
+        with self._lock, self._conn:
+            return self._conn.execute(
+                "UPDATE sessions SET status = 'confirmed', day = sug_day, start_min = sug_start_min, "
+                "end_min = sug_end_min, sug_day = NULL, sug_start_min = NULL, sug_end_min = NULL, "
+                "sug_note = '', updated_at = ? WHERE id = ? AND status = 'countered' AND sug_day IS NOT NULL",
+                (_now(), sid)).rowcount == 1
+
+    def move_session(self, sid: int, day: date, start_min: int, end_min: int) -> bool:
+        """Change the time of a confirmed session."""
+        self._check_windows([(start_min, end_min)])
+        return self.transition(sid, ('confirmed',), 'confirmed', day=day, start_min=start_min, end_min=end_min)
+
+    def close_finished(self, today_: date, now_min: int) -> List[Tuple[int, str]]:
+        """Open proposals whose start has passed become 'expired'; confirmed sessions whose end
+        has passed become 'done'. Returns [(id, new_status)]."""
+        iso = today_.isoformat()
+        changed: List[Tuple[int, str]] = []
+        with self._lock, self._conn:
+            for statuses, col, new in ((SESSION_OPEN, 'start_min', 'expired'), (('confirmed',), 'end_min', 'done')):
+                marks = ','.join('?' * len(statuses))
+                rows = self._conn.execute(
+                    f'SELECT id FROM sessions WHERE status IN ({marks}) AND (day < ? OR (day = ? AND {col} <= ?))',
+                    [*statuses, iso, iso, now_min]).fetchall()
+                for r in rows:
+                    self._conn.execute('UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?',
+                                       (new, _now(), r['id']))
+                    changed.append((r['id'], new))
+        return changed
 
     # ------------------------------------------------------------ settings
 

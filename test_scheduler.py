@@ -11,9 +11,10 @@ import threading
 from datetime import date
 
 from schedule_dates import DateParseError, format_days, parse_dates, parse_month
-from schedule_store import MIGRATIONS, ScheduleStore, prune_backups
+from schedule_store import MIGRATIONS, ProposalLimitError, ScheduleStore, prune_backups
+import calendar_links as cl
 from schedule_times import (
-    DAY, TimeParseError, best_slots, format_windows, gm_calendar_days, gm_day_summary,
+    DAY, TimeParseError, best_slots, describe_session_time, overlaps, parse_session_time, format_windows, gm_calendar_days, gm_day_summary,
     group_days_by_windows, merge, parse_times, player_calendar_days, player_day_summary, subtract,
 )
 
@@ -382,6 +383,191 @@ def test_render_month():
     print('✓ Calendar renders')
 
 
+def test_parse_session_time():
+    assert parse_session_time('7pm') == (h(19), h(23))                 # default 4 hours
+    assert parse_session_time('7pm', 180) == (h(19), h(22))
+    assert parse_session_time('9pm') == (h(21), 1440)                   # capped at midnight
+    assert parse_session_time('7pm-10pm') == (h(19), h(22))
+    assert parse_session_time('7-10pm') == (h(19), h(22))
+    assert parse_session_time('from 19:00 to 22:30') == (h(19), h(22, 30))
+    assert parse_session_time('19:00') == (h(19), h(23))
+    assert parse_session_time('2pm') == (h(14), h(18))
+    for bad in ['', '  ', 'evenings', 'after 7pm', '7', '7-10', '10pm-7pm', '25:00', 'soon', '7pm, 9pm', 'midnight']:
+        try:
+            parse_session_time(bad)
+        except TimeParseError:
+            continue
+        raise AssertionError(f'{bad!r} should not parse')
+    assert overlaps([(h(12), h(14))], (h(13), h(15))) and not overlaps([(h(12), h(14))], (h(14), h(15)))
+    assert describe_session_time(date(2026, 12, 5), h(19), h(22)) == 'Sat 5 Dec, 19:00–22:00'
+    print('✓ Session times')
+
+
+def test_calendar_links():
+    from zoneinfo import ZoneInfo
+    uk = ZoneInfo('Europe/London')
+    # December is GMT (UTC+0), July is BST (UTC+1)
+    assert cl.to_utc(date(2026, 12, 5), h(19), uk).strftime('%H:%M') == '19:00'
+    assert cl.to_utc(date(2026, 7, 4), h(19), uk).strftime('%H:%M') == '18:00'
+    assert cl.to_utc(date(2026, 7, 4), 1440, uk).strftime('%Y-%m-%d %H:%M') == '2026-07-04 23:00'
+    start, end = cl.to_utc(date(2026, 12, 5), h(19), uk), cl.to_utc(date(2026, 12, 5), h(22), uk)
+
+    assert cl.ics_escape('a;b,c\\d\ne\x00') == 'a\\;b\\,c\\\\d\\ne'
+    ev = cl.ics_event('session-1@x', 'Up the canyon; path, now', start, end, 'Line one\nLine two',
+                      'Discord', stamp=start)
+    ics = cl.ics_calendar([ev], 'Fellgard sessions').decode()
+    assert ics.startswith('BEGIN:VCALENDAR\r\nVERSION:2.0\r\n') and ics.endswith('END:VCALENDAR\r\n')
+    assert 'DTSTART:20261205T190000Z\r\n' in ics and 'DTEND:20261205T220000Z\r\n' in ics
+    assert 'SUMMARY:Up the canyon\\; path\\, now\r\n' in ics
+    assert 'DESCRIPTION:Line one\\nLine two\r\n' in ics and 'UID:session-1@x\r\n' in ics
+    assert '\n' not in ics.replace('\r\n', '')        # every line ends CRLF
+
+    # Long lines fold at 75 octets without splitting characters
+    long_line = 'DESCRIPTION:' + 'é' * 100
+    folded = cl.fold(long_line)
+    assert all(len(part.encode()) <= 75 for part in folded.split('\r\n'))
+    assert folded.replace('\r\n ', '') == long_line
+
+    g = cl.google_url('Up the canyon path', start, end, 'details here', 'Discord')
+    assert g.startswith('https://calendar.google.com/calendar/render?action=TEMPLATE')
+    assert 'dates=20261205T190000Z%2F20261205T220000Z' in g and 'text=Up+the+canyon+path' in g
+    o = cl.outlook_url('Up the canyon path', start, end, 'details here', 'Discord')
+    assert o.startswith('https://outlook.live.com/calendar/0/deeplink/compose?') and 'startdt=2026-12-05T19%3A00%3A00Z' in o
+    # Huge descriptions get dropped rather than breaking Discord's 512-character button limit
+    assert len(cl.google_url('t', start, end, 'x' * 2000, 'Discord')) <= 512
+    assert len(cl.outlook_url('t', start, end, 'x' * 2000, 'Discord')) <= 512
+    print('✓ Calendar files and links')
+
+
+def test_store_sessions():
+    s = ScheduleStore(':memory:')
+    sid = s.create_session(111, 'Sam', d(12, 12), h(19), h(22), '  Clear the\ncave  ', 5, guild_id=9)
+    got = s.get_session(sid)
+    assert got['status'] == 'proposed' and got['goal'] == 'Clear the cave' and got['day'] == d(12, 12)
+    assert got['players'] == [('111', 'Sam')] and got['party_size'] == 5 and got['guild_id'] == '9'
+
+    # Join / leave
+    assert s.join_session(sid, 222, 'Bea') == 'joined' and s.join_session(sid, 222, 'Beatrice') == 'already'
+    assert [n for _, n in s.get_session(sid)['players']] == ['Sam', 'Beatrice']
+    assert s.leave_session(sid, 222) == 'left' and s.leave_session(sid, 222) == 'not_in'
+    assert s.join_session(9999, 1, 'x') == 'closed'
+
+    # Limit applies to open proposals only
+    for n in range(2):
+        s.create_session(111, 'Sam', d(13 + n, 12), h(19), h(22), f'goal {n}', 5, max_open=3)
+    try:
+        s.create_session(111, 'Sam', d(20, 12), h(19), h(22), 'one too many', 5, max_open=3)
+        raise AssertionError('limit not enforced')
+    except ProposalLimitError as e:
+        assert e.limit == 3
+    assert s.create_session(222, 'Bea', d(20, 12), h(19), h(22), 'someone else', 5, max_open=3)
+    assert s.transition(sid, ('proposed',), 'declined')
+    s.create_session(111, 'Sam', d(20, 12), h(19), h(22), 'room again', 5, max_open=3)   # a slot freed up
+    try:
+        s.create_session(111, 'Sam', d(1, 12), h(19), h(22), '   ', 5)
+        raise AssertionError('empty goal accepted')
+    except ValueError:
+        pass
+
+    # Closed sessions can't be joined
+    assert s.join_session(sid, 333, 'Cass') == 'closed' and s.leave_session(sid, 111) == 'closed'
+    print('✓ Session store')
+
+
+def test_session_state_machine():
+    s = ScheduleStore(':memory:')
+    sid = s.create_session(1, 'Sam', d(12, 12), h(19), h(22), 'goal', 5)
+    # Counter-offer, then the proposer accepts it
+    assert s.suggest_time(sid, d(13, 12), h(14), h(18), 'Sat afternoon is better')
+    got = s.get_session(sid)
+    assert got['status'] == 'countered' and got['sug_day'] == d(13, 12) and got['sug_note'] == 'Sat afternoon is better'
+    assert s.accept_suggestion(sid)
+    got = s.get_session(sid)
+    assert got['status'] == 'confirmed' and got['day'] == d(13, 12) and (got['start_min'], got['end_min']) == (h(14), h(18))
+    assert got['sug_day'] is None and not s.accept_suggestion(sid)
+    # Confirmed sessions can move, not be suggested at
+    assert s.move_session(sid, d(14, 12), h(19), h(22)) and s.get_session(sid)['day'] == d(14, 12)
+    assert not s.suggest_time(sid, d(15, 12), h(19), h(22))
+    # Only whitelisted columns can be changed through transition()
+    try:
+        s.transition(sid, ('confirmed',), 'confirmed', proposer_id='999')
+        raise AssertionError('arbitrary column accepted')
+    except ValueError:
+        pass
+    assert s.transition(sid, ('confirmed',), 'confirmed', event_id='555') and s.get_session(sid)['event_id'] == '555'
+    assert not s.transition(sid, ('proposed',), 'declined')
+
+    # Housekeeping: open proposals expire at their start, confirmed sessions finish at their end
+    a = s.create_session(1, 'Sam', d(20, 11), h(19), h(22), 'old proposal', 5)
+    b = s.create_session(2, 'Bea', d(20, 11), h(19), h(22), 'old session', 5)
+    s.transition(b, ('proposed',), 'confirmed')
+    c = s.create_session(3, 'Cass', d(20, 11), h(19), h(22), 'future', 5)
+    assert s.close_finished(d(20, 11), h(18)) == []
+    assert sorted(s.close_finished(d(20, 11), h(19))) == [(a, 'expired'), (c, 'expired')]
+    assert s.close_finished(d(20, 11), h(21)) == []
+    assert s.close_finished(d(20, 11), h(22)) == [(b, 'done')]
+    assert s.get_session(a)['status'] == 'expired' and s.get_session(b)['status'] == 'done'
+    # Listing
+    confirmed = s.list_sessions(['confirmed'], d(1, 12), d(31, 12))
+    assert [x['id'] for x in confirmed] == [sid]
+    print('✓ Session state machine')
+
+
+def test_session_race():
+    """Twenty people hit Approve at once: exactly one wins."""
+    with tempfile.TemporaryDirectory() as tmp:
+        s = ScheduleStore(os.path.join(tmp, 'schedule.db'))
+        sid = s.create_session(1, 'Sam', d(12, 12), h(19), h(22), 'goal', 5)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(s.transition(sid, ('proposed',), 'confirmed')))
+                   for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results.count(True) == 1 and results.count(False) == 19
+        # ...and 20 people joining at once all land
+        sid2 = s.create_session(2, 'Bea', d(13, 12), h(19), h(22), 'goal', 5)
+        threads = [threading.Thread(target=s.join_session, args=(sid2, 100 + i, f'P{i}')) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(s.get_session(sid2)['players']) == 21
+        s.close()
+    print('✓ Approve and join races')
+
+
+def test_migration_v2_to_v3():
+    """The first deployed version (times, no sessions) upgrades without losing availability."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'schedule.db')
+        s = ScheduleStore(path)
+        s.close()
+        old = sqlite3.connect(path)
+        old.execute('DROP TABLE session_players')
+        old.execute('DROP TABLE sessions')
+        old.execute('PRAGMA user_version = 2')
+        old.commit()
+        old.close()
+        s = ScheduleStore(path)   # upgrade is only 2 -> 3, so seed availability through the real API first
+        s.set_gm_days([d(3, 12)], 'open', [(h(19), 1440)], 'kept')
+        s.close()
+        old = sqlite3.connect(path)
+        old.execute('DROP TABLE session_players')
+        old.execute('DROP TABLE sessions')
+        old.execute('PRAGMA user_version = 2')
+        old.commit()
+        old.close()
+        s = ScheduleStore(path)
+        assert s.schema_version == len(MIGRATIONS)
+        assert s.gm_days(d(3, 12), d(3, 12)) == {d(3, 12): [('open', h(19), 1440, 'kept')]}
+        assert s.create_session(1, 'Sam', d(12, 12), h(19), h(22), 'goal', 5)
+        assert os.path.exists(path + '.before-v3')
+        s.close()
+    print('✓ Migration to sessions')
+
+
 def run_tests():
     print('Running scheduler tests...\n')
     test_single_dates()
@@ -396,11 +582,17 @@ def run_tests():
     test_window_algebra()
     test_summaries()
     test_best_slots()
+    test_parse_session_time()
+    test_calendar_links()
     test_store_gm()
     test_store_players()
     test_store_text_is_stored_raw()
     test_store_concurrent_writes()
     test_migration_keeps_existing_data()
+    test_store_sessions()
+    test_session_state_machine()
+    test_session_race()
+    test_migration_v2_to_v3()
     test_settings_and_persistence()
     test_backup_and_prune()
     test_render_month()

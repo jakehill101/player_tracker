@@ -15,3 +15,25 @@ calendar_title: "Tales from Fellgard · sessions"
 
 # Most days one command can mark (stops typos like "Jan - Dec")
 max_days_per_command: 120
+
+# --- Session proposals ---
+
+# A lone start time ("7pm") runs this long
+default_session_hours: 4
+
+# Party size when the proposer doesn't give one, and the largest they can ask for.
+# It is a guide: more players can still join.
+default_party_size: 5
+max_party_size: 12
+
+# How many proposals one person can have waiting for the GM at once
+max_open_proposals: 3
+
+# How far ahead a session can be proposed
+max_days_ahead: 180
+
+# Shown as the location of the Discord event and in calendar entries
+event_location: "Discord"
+
+# Discord event names look like "Fellgard: Clear the goblin cave"
+event_name_prefix: "Fellgard"

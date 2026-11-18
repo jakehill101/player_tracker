@@ -235,6 +235,41 @@ def parse_times(spec: Optional[str]) -> List[Window]:
     return merge(_parse_part(re.sub(r'\s+', ' ', p)) for p in parts)
 
 
+def parse_session_time(spec: Optional[str], default_minutes: int = 240) -> Window:
+    """Parse when a single session runs: a start time ('7pm') or a range ('7pm-10pm').
+
+    A lone start time runs for `default_minutes`, up to midnight at most.
+    """
+    spec = re.sub(r'\s+', ' ', (spec or '').strip().lower())
+    if not spec:
+        raise TimeParseError("Say what time the session starts, e.g. '7pm' or '7pm-10pm'.")
+    hint = f"I couldn't read '{spec}' as a session time. Try '7pm' or '7pm-10pm'."
+    body = re.sub(r'^(?:from|between)\s+', '', spec)
+    pieces = _SEP.split(body)
+    try:
+        if len(pieces) == 2 and all(pieces):
+            return _range(pieces[0], pieces[1])
+        if len(pieces) == 1:
+            start = _single(_read(body), 'start')
+            if 0 < start < 1440:
+                return start, min(start + default_minutes, 1440)
+    except TimeParseError as e:
+        if 'am or pm' in str(e) or 'ends before' in str(e) or "isn't a real time" in str(e):
+            raise
+    raise TimeParseError(hint)
+
+
+def overlaps(windows: Iterable[Window], window: Window) -> bool:
+    """True if `window` touches any of `windows`."""
+    return subtract([window], windows) != [window]
+
+
+def describe_session_time(day, start: int, end: int) -> str:
+    """'Sat 5 Dec, 19:00–22:00'"""
+    import calendar as _cal
+    return f'{_cal.day_abbr[day.weekday()]} {day.day} {_cal.month_abbr[day.month]}, {hhmm(start)}–{hhmm(end)}'
+
+
 # -------------------------------------------------- summaries for display
 
 def gm_day_summary(rows) -> Optional[Tuple[str, List[Window], str]]:
