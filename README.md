@@ -1,6 +1,6 @@
 # Player Tracker - Discord D&D 5e Bot
 
-A comprehensive Discord bot system for tracking player inventory, XP, gold, and in-game time in tabletop RPG campaigns. Features five specialized bots working together: player tracker, merchant system, timekeeper, inn management, and choose-your-own-adventure events.
+A comprehensive Discord bot system for tracking player inventory, XP, gold, and in-game time in tabletop RPG campaigns. Features six specialized bots working together: player tracker, merchant system, timekeeper, inn management, choose-your-own-adventure events, and session scheduling.
 
 ## Features
 
@@ -35,17 +35,27 @@ See [TIMEKEEPER_GUIDE.md](TIMEKEEPER_GUIDE.md) for detailed documentation on the
 
 See [ADVENTURE_GUIDE.md](ADVENTURE_GUIDE.md) for detailed documentation on creating and managing adventures.
 
+### Session Scheduler (NEW)
+- **GM Availability**: Say when you can (or can't) run, a month at a time: `/gm open 3, 5, 12 Dec after 7pm`
+- **Player Availability**: Players say when they're free with `/available` and `/unavailable`, whole days or just part of a day
+- **Overlap**: `/whosfree 12 Dec` shows the times the GM and players are all free
+- **Calendar View**: `/calendar` posts a month grid; `/gm pin_calendar` keeps a self-updating one pinned
+- **Its own database**: SQLite on the VM with nightly backups, separate from the Google Sheet
+
+See [SCHEDULER_GUIDE.md](SCHEDULER_GUIDE.md) for commands and setup.
+
 ## Setup
 
 ### Prerequisites
 
 - Python 3.8 or higher
-- Five Discord Bot Tokens ([Create them here](https://discord.com/developers/applications))
+- Six Discord Bot Tokens ([Create them here](https://discord.com/developers/applications))
   - One for the main player tracker bot
   - One for the merchant bot
   - One for the timekeeper bot
   - One for the inn bot
-  - One for the adventure bot (NEW)
+  - One for the adventure bot
+  - One for the scheduler bot (NEW)
 - A Google Cloud Project with Sheets API enabled ([Guide](https://developers.google.com/sheets/api/quickstart/python))
 - Google Service Account credentials JSON file
 
@@ -118,7 +128,7 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=20
 
 ### Running the Bots Locally
 
-Run all five bots (each in a separate terminal):
+Run all six bots (each in a separate terminal):
 
 ```bash
 # Terminal 1 - Main Player Tracker
@@ -133,8 +143,11 @@ python timekeeper_bot.py
 # Terminal 4 - Inn Bot
 python inn_bot.py
 
-# Terminal 5 - Adventure Bot (NEW)
+# Terminal 5 - Adventure Bot
 python adventure_bot.py
+
+# Terminal 6 - Scheduler Bot (NEW)
+python scheduler_bot.py
 ```
 
 All bots will connect to Discord and sync their slash commands.
@@ -331,7 +344,10 @@ Using the merchant bot's GM commands, you can create custom shops for different 
 - **merchant_bot.py**: Separate Discord bot for merchant/shop system
 - **timekeeper_bot.py**: Separate Discord bot for in-game time tracking
 - **inn_bot.py**: Separate Discord bot for inn management
-- **adventure_bot.py**: Separate Discord bot for choose-your-own-adventure events (NEW)
+- **adventure_bot.py**: Separate Discord bot for choose-your-own-adventure events
+- **scheduler_bot.py**: Separate Discord bot for availability and the session calendar (NEW)
+- **schedule_dates.py / schedule_times.py / schedule_store.py / calendar_render.py**: Scheduler date and time parsing, SQLite storage and calendar image
+- **scheduler_config.yaml**: Scheduler settings (timezone, database path, backups)
 - **storage.py**: Google Sheets integration for data persistence
 - **dnd_utils.py**: D&D 5e game mechanics (XP thresholds, currency conversion, level calculations)
 - **timekeeper_config.yaml**: Configuration for time tracking and weekly events

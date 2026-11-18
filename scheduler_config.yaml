@@ -1,0 +1,17 @@
+# Scheduler bot configuration
+
+# IANA timezone for "today" and for showing dates; follows GMT/BST
+timezone: "Europe/London"
+
+# SQLite database (created on first run). Keep it out of git.
+database: "data/schedule.db"
+
+# Nightly backups of the database, newest N kept
+backup_dir: "backups"
+backup_keep: 14
+
+# Subtitle under the month name on the calendar image
+calendar_title: "Tales from Fellgard · sessions"
+
+# Most days one command can mark (stops typos like "Jan - Dec")
+max_days_per_command: 120

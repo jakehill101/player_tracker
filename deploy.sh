@@ -105,6 +105,14 @@ if [ ! -f "credentials.json" ]; then
     echo "Please add your Google Service Account credentials file"
 fi
 
+# Secrets should only be readable by the bot user
+chmod 600 .env 2>/dev/null || true
+chmod 600 credentials.json 2>/dev/null || true
+
+# Scheduler data and backups (SQLite, owner-only)
+mkdir -p data backups
+chmod 700 data backups
+
 # Update the service file with current user and path
 echo ""
 echo "Configuring systemd services..."
@@ -116,6 +124,7 @@ sed -e "s|/home/YOUR_USERNAME/player_tracker|$CURRENT_DIR|g" -e "s|YOUR_USERNAME
 sed -e "s|/home/YOUR_USERNAME/player_tracker|$CURRENT_DIR|g" -e "s|YOUR_USERNAME|$CURRENT_USER|g" timekeeper_bot.service > timekeeper_bot.service.tmp
 sed -e "s|/home/YOUR_USERNAME/player_tracker|$CURRENT_DIR|g" -e "s|YOUR_USERNAME|$CURRENT_USER|g" inn_bot.service > inn_bot.service.tmp
 sed -e "s|/home/YOUR_USERNAME/player_tracker|$CURRENT_DIR|g" -e "s|YOUR_USERNAME|$CURRENT_USER|g" adventure_bot.service > adventure_bot.service.tmp
+sed -e "s|/home/YOUR_USERNAME/player_tracker|$CURRENT_DIR|g" -e "s|YOUR_USERNAME|$CURRENT_USER|g" scheduler_bot.service > scheduler_bot.service.tmp
 
 # Install systemd services
 echo ""
@@ -126,17 +135,19 @@ sudo cp merchant_bot.service.tmp /etc/systemd/system/merchant_bot.service
 sudo cp timekeeper_bot.service.tmp /etc/systemd/system/timekeeper_bot.service
 sudo cp inn_bot.service.tmp /etc/systemd/system/inn_bot.service
 sudo cp adventure_bot.service.tmp /etc/systemd/system/adventure_bot.service
+sudo cp scheduler_bot.service.tmp /etc/systemd/system/scheduler_bot.service
 rm player_tracker.service.tmp
 rm merchant_bot.service.tmp
 rm timekeeper_bot.service.tmp
 rm inn_bot.service.tmp
 rm adventure_bot.service.tmp
+rm scheduler_bot.service.tmp
 sudo systemctl daemon-reload
 echo -e "${GREEN}✓${NC} Systemd services installed"
 
 # Ask if user wants to enable and start the services
 echo ""
-read -p "Do you want to enable and start all five bots now? (y/n) " -n 1 -r
+read -p "Do you want to enable and start all six bots now? (y/n) " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     sudo systemctl enable player_tracker.service
@@ -144,11 +155,13 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     sudo systemctl enable timekeeper_bot.service
     sudo systemctl enable inn_bot.service
     sudo systemctl enable adventure_bot.service
+    sudo systemctl enable scheduler_bot.service
     sudo systemctl start player_tracker.service
     sudo systemctl start merchant_bot.service
     sudo systemctl start timekeeper_bot.service
     sudo systemctl start inn_bot.service
     sudo systemctl start adventure_bot.service
+    sudo systemctl start scheduler_bot.service
     echo -e "${GREEN}✓${NC} Services enabled and started"
     echo ""
     echo "Player Tracker Bot status:"
@@ -165,6 +178,9 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo ""
     echo "Adventure Bot status:"
     sudo systemctl status adventure_bot.service --no-pager
+    echo ""
+    echo "Scheduler Bot status:"
+    sudo systemctl status scheduler_bot.service --no-pager
 else
     echo ""
     echo "Services installed but not started."
@@ -174,11 +190,13 @@ else
     echo "  sudo systemctl enable timekeeper_bot.service"
     echo "  sudo systemctl enable inn_bot.service"
     echo "  sudo systemctl enable adventure_bot.service"
+    echo "  sudo systemctl enable scheduler_bot.service"
     echo "  sudo systemctl start player_tracker.service"
     echo "  sudo systemctl start merchant_bot.service"
     echo "  sudo systemctl start timekeeper_bot.service"
     echo "  sudo systemctl start inn_bot.service"
     echo "  sudo systemctl start adventure_bot.service"
+    echo "  sudo systemctl start scheduler_bot.service"
 fi
 
 echo ""
@@ -224,10 +242,15 @@ echo "  sudo systemctl restart adventure_bot    - Restart the bot"
 echo "  sudo journalctl -u adventure_bot -f     - View live logs"
 echo "  sudo journalctl -u adventure_bot -n 50  - View last 50 log lines"
 echo ""
+echo "Useful commands for Scheduler Bot:"
+echo "  sudo systemctl status scheduler_bot     - Check service status"
+echo "  sudo systemctl restart scheduler_bot    - Restart the bot"
+echo "  sudo journalctl -u scheduler_bot -f     - View live logs"
+echo ""
 echo "Or use the helper scripts:"
 echo "  ./start.sh      - Start all bots"
 echo "  ./stop.sh       - Stop all bots"
 echo "  ./restart.sh    - Restart all bots"
 echo "  ./status.sh     - Check status of all bots"
-echo "  ./logs.sh [bot] - View logs (player_tracker, merchant, timekeeper, inn, adventure)"
+echo "  ./logs.sh [bot] - View logs (player_tracker, merchant, timekeeper, inn, adventure, scheduler)"
 echo ""
