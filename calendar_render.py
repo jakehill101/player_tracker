@@ -6,7 +6,7 @@ Kept free of discord imports so it can be unit tested. Returns PNG bytes.
 import calendar
 import io
 from datetime import date
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -18,11 +18,13 @@ INK = (59, 47, 34)
 MUTED = (128, 112, 92)
 GRID = (196, 182, 156)
 EMPTY_CELL = (251, 247, 238)
-OPEN_FILL = (214, 232, 200)
-OPEN_EDGE = (79, 125, 52)
+# GM free is a small amber badge only. Green is kept for confirmed sessions.
+OPEN_BADGE = (184, 126, 20)
+SESSION_FILL = (214, 232, 200)
+SESSION_EDGE = (79, 125, 52)
 BLOCKED_FILL = (226, 214, 210)
 BLOCKED_EDGE = (150, 84, 76)
-TODAY_EDGE = (176, 120, 30)
+TODAY_EDGE = (62, 92, 130)
 PAST_SHADE = (244, 236, 216, 150)
 
 CELL_W, CELL_H = 160, 118
@@ -65,6 +67,7 @@ def render_month(
     player_days: Dict[date, Dict[str, List[str]]],
     today: date,
     title: str = 'Sessions',
+    sessions: Optional[Dict[date, List[Tuple[str, str]]]] = None,
 ) -> bytes:
     """Render one month.
 
@@ -72,7 +75,10 @@ def render_month(
         (see schedule_times.gm_calendar_days)
     player_days: {date: {'free': [names], 'busy': [names]}}
         (see schedule_times.player_calendar_days)
+    sessions: {date: [(time_text, title)]} confirmed sessions, drawn green. A day with
+        a session shows that instead of the GM's availability.
     """
+    sessions = sessions or {}
     weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)  # Monday first
     width = MARGIN * 2 + CELL_W * 7
     height = MARGIN + HEADER_H + WEEKDAY_H + CELL_H * len(weeks) + LEGEND_H + MARGIN
@@ -108,8 +114,10 @@ def render_month(
             gm = gm_days.get(d) if in_month else None
             players = player_days.get(d, {'free': [], 'busy': []}) if in_month else None
 
-            if gm and gm[0] == 'open':
-                fill, edge = OPEN_FILL, OPEN_EDGE
+            day_sessions = sessions.get(d) if in_month else None
+
+            if day_sessions:
+                fill, edge = SESSION_FILL, SESSION_EDGE
             elif gm and gm[0] == 'blocked':
                 fill, edge = BLOCKED_FILL, BLOCKED_EDGE
             else:
@@ -125,13 +133,22 @@ def render_month(
             pad = 12
             draw.text((x0 + pad, y0 + 8), str(d.day), font=f_day, fill=INK)
 
-            if gm:
-                tag = 'GM free' if gm[0] == 'open' else 'GM away'
-                tw = draw.textlength(tag, font=f_tag)
-                draw.rounded_rectangle(
-                    [x1 - tw - 18, y0 + 10, x1 - 8, y0 + 28], radius=6, fill=edge
-                )
-                draw.text((x1 - tw - 13, y0 + 12), tag, font=f_tag, fill=(255, 255, 255))
+            def badge(label, colour):
+                tw = draw.textlength(label, font=f_tag)
+                draw.rounded_rectangle([x1 - tw - 18, y0 + 10, x1 - 8, y0 + 28], radius=6, fill=colour)
+                draw.text((x1 - tw - 13, y0 + 12), label, font=f_tag, fill=(255, 255, 255))
+
+            if day_sessions:
+                badge('Session', SESSION_EDGE)
+                text_y = y0 + 38
+                for time_text, name in day_sessions[:2]:
+                    line = _fit(draw, time_text, f_tag, CELL_W - pad * 2)
+                    draw.text((x0 + pad, text_y), line, font=f_tag, fill=INK)
+                    draw.text((x0 + pad, text_y + 16), _fit(draw, name, f_small, CELL_W - pad * 2),
+                              font=f_small, fill=INK)
+                    text_y += 34
+            elif gm:
+                badge('GM free' if gm[0] == 'open' else 'GM away', OPEN_BADGE if gm[0] == 'open' else BLOCKED_EDGE)
                 text_y = y0 + 38
                 if merge(gm[1]) != [DAY]:
                     times = _fit(draw, format_windows(gm[1]), f_tag, CELL_W - pad * 2)
@@ -147,7 +164,7 @@ def render_month(
                     line = f"{len(free)} free: " + ', '.join(free)
                     draw.text(
                         (x0 + pad, y1 - 44), _fit(draw, line, f_small, CELL_W - pad * 2),
-                        font=f_small, fill=OPEN_EDGE,
+                        font=f_small, fill=INK,
                     )
                 if players['busy']:
                     draw.text(
@@ -164,7 +181,8 @@ def render_month(
     ly = grid_top + CELL_H * len(weeks) + 16
     x = MARGIN
     for label, colour in (
-        ('GM free', OPEN_EDGE),
+        ('GM free', OPEN_BADGE),
+        ('Session', SESSION_EDGE),
         ('GM away', BLOCKED_EDGE),
         ('Today', TODAY_EDGE),
     ):

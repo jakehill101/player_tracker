@@ -371,7 +371,8 @@ def test_render_month():
           d(4, 12): ('open', [(h(12), h(14)), (h(19), h(22))], ''),
           d(24, 12): ('blocked', [DAY], '')}
     players = {d(3, 12): {'free': ['Sam', 'Alex', 'Bea', 'Cass', 'Dev'], 'busy': ['Fen']}}
-    png = render_month(2026, 12, gm, players, TODAY, 'Tales from Fellgard · sessions')
+    sessions = {d(12, 12): [('19:00', 'The Wyrm bridges (3/5)')], d(13, 12): [('12:00', 'A'), ('19:00', 'B'), ('21:00', 'C')]}
+    png = render_month(2026, 12, gm, players, TODAY, 'Tales from Fellgard · sessions', sessions)
     img = Image.open(io.BytesIO(png))
     assert img.format == 'PNG' and img.width == 28 * 2 + 160 * 7
     # Empty month renders too

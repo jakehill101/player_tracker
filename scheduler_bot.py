@@ -162,7 +162,7 @@ async def refresh_pinned_calendar():
 def pinned_text() -> str:
     stamp = int(datetime.now(TZ).timestamp())
     return (
-        '**Session calendar**: this month and next. Green is when the GM is free.\n'
+        '**Session calendar**: this month and next. An amber badge shows when the GM is free.\n'
         'Add your own availability with `/available` and `/unavailable`. '
         f'`/calendar` shows any month.\n-# Updated <t:{stamp}:R>'
     )
