@@ -27,7 +27,8 @@ from schedule_times import (
     TimeParseError, best_slots, format_windows, gm_calendar_days, group_days_by_windows,
     is_all_day, parse_times, player_calendar_days, player_day_summary,
 )
-from schedule_store import ScheduleStore, prune_backups
+from schedule_store import SESSION_LIVE, SESSION_OPEN, ScheduleStore, prune_backups
+from scheduler_sessions import SessionManager
 
 load_dotenv()
 
@@ -41,6 +42,13 @@ DEFAULT_CONFIG = {
     'backup_keep': 14,
     'calendar_title': 'Tales from Fellgard · sessions',
     'max_days_per_command': 120,
+    'default_session_hours': 4,
+    'default_party_size': 5,
+    'max_party_size': 12,
+    'max_open_proposals': 3,
+    'max_days_ahead': 180,
+    'event_location': 'Discord',
+    'event_name_prefix': 'Fellgard',
 }
 
 
@@ -68,6 +76,7 @@ bot = commands.Bot(
     allowed_mentions=discord.AllowedMentions.none(),
 )
 store: Optional[ScheduleStore] = None
+sessions: Optional[SessionManager] = None
 _refresh_lock = asyncio.Lock()
 
 PIN_CHANNEL_KEY = 'pinned_calendar_channel'
@@ -122,8 +131,9 @@ async def render_month_file(year: int, month: int, filename: str = None) -> disc
     start, end = month_bounds(year, month)
     gm = gm_calendar_days(await asyncio.to_thread(store.gm_days, start, end))
     players = player_calendar_days(await asyncio.to_thread(store.player_days, start, end))
+    booked = await sessions.calendar_sessions(start, end)
     png = await asyncio.to_thread(
-        render_month, year, month, gm, players, today(), config['calendar_title']
+        render_month, year, month, gm, players, today(), config['calendar_title'], booked
     )
     return discord.File(io.BytesIO(png), filename=filename or f'calendar-{year}-{month:02d}.png')
 
@@ -163,14 +173,29 @@ def pinned_text() -> str:
     stamp = int(datetime.now(TZ).timestamp())
     return (
         '**Session calendar**: this month and next. An amber badge shows when the GM is free.\n'
-        'Add your own availability with `/available` and `/unavailable`. '
+        'Add your own availability with `/available` and `/unavailable`, and propose a session with `/propose`. '
         f'`/calendar` shows any month.\n-# Updated <t:{stamp}:R>'
     )
 
 
+_refresh_waiting = False
+
+
 def schedule_refresh():
-    """Fire-and-forget refresh after a change."""
-    asyncio.create_task(refresh_pinned_calendar())
+    """Redraw the pinned calendar soon. Several changes close together (a few people
+    joining at once) share one redraw."""
+    global _refresh_waiting
+    if _refresh_waiting:
+        return
+    _refresh_waiting = True
+
+    async def later():
+        global _refresh_waiting
+        await asyncio.sleep(2)
+        _refresh_waiting = False
+        await refresh_pinned_calendar()
+
+    asyncio.create_task(later())
 
 
 async def send_error(interaction: discord.Interaction, message: str):
@@ -186,9 +211,15 @@ async def send_error(interaction: discord.Interaction, message: str):
 async def on_ready():
     global store
     print(f'{bot.user} has connected to Discord!')
+    global sessions
     if store is None:
         store = ScheduleStore(config['database'])
         print(f"Schedule database: {config['database']} (schema v{store.schema_version})")
+    if sessions is None:
+        sessions = SessionManager(bot, store, config, TZ, user_is_gm, GM_ROLE_ID, schedule_refresh)
+        await sessions.register_views()
+    if not session_housekeeping.is_running():
+        session_housekeeping.start()
     if not nightly_backup.is_running():
         nightly_backup.start()
     if not daily_refresh.is_running():
@@ -213,6 +244,16 @@ async def nightly_backup():
         print(f'Backed up schedule to {dest} (pruned {len(removed)})')
     except Exception as e:
         print(f'Schedule backup failed: {e}')
+
+
+@tasks.loop(minutes=10)
+async def session_housekeeping():
+    """Expire proposals nobody answered in time and mark past sessions finished."""
+    if sessions:
+        try:
+            await sessions.housekeeping()
+        except Exception as e:
+            print(f'Session housekeeping failed: {e!r}')
 
 
 @tasks.loop(hours=1)
@@ -481,6 +522,55 @@ async def whosfree(interaction: discord.Interaction, day: str):
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name='propose', description='Propose a session. The GM approves it')
+@app_commands.rename(day='date', when='time')
+@app_commands.describe(
+    day="One date, e.g. '12 Dec'",
+    when="Start time, e.g. '7pm', or a range like '7pm-10pm'",
+    goal="What you'd like to do, e.g. 'Clear the goblin cave'",
+    party_size="How many players you're hoping for (a guide, not a hard limit)",
+)
+@app_commands.guild_only()
+async def propose(interaction: discord.Interaction, day: str, when: str, goal: str,
+                  party_size: Optional[int] = None):
+    await sessions.propose(interaction, day, when, goal, party_size)
+
+
+@bot.tree.command(name='sessions', description='Upcoming sessions and proposals')
+@app_commands.describe(private='Only show it to you')
+@app_commands.guild_only()
+async def sessions_cmd(interaction: discord.Interaction, private: bool = False):
+    upcoming = await asyncio.to_thread(store.list_sessions, SESSION_LIVE, today())
+    if not upcoming:
+        await interaction.response.send_message('Nothing is planned yet. Try `/propose`.', ephemeral=True)
+        return
+    icons = {'confirmed': '✅', 'proposed': '🗳️', 'countered': '↔️'}
+    lines = []
+    for s in upcoming[:20]:
+        text = (f"{icons[s['status']]} **{sessions.when_text(s)}**: "
+                f"{discord.utils.escape_markdown(s['goal'])} ({len(s['players'])}/{s['party_size']})")
+        url = sessions.jump_url(s)
+        lines.append(text + (f' [open]({url})' if url else ''))
+    waiting = sum(1 for s in upcoming if s['status'] in SESSION_OPEN)
+    embed = discord.Embed(title='Upcoming sessions', description='\n'.join(lines)[:4000],
+                          color=discord.Color.dark_gold())
+    if waiting:
+        embed.set_footer(text=f'{waiting} waiting for the GM')
+    await interaction.response.send_message(embed=embed, ephemeral=private)
+
+
+@gm.command(name='hub_line', description='The next confirmed session, as lines to paste into the hub home note')
+@is_gm()
+async def gm_hub_line(interaction: discord.Interaction):
+    upcoming = await asyncio.to_thread(store.list_sessions, ('confirmed',), today())
+    if not upcoming:
+        await interaction.response.send_message('There is no confirmed session coming up.', ephemeral=True)
+        return
+    nxt = upcoming[0]
+    await interaction.response.send_message(
+        f"Next: **{sessions.when_text(nxt)}**\n" + sessions.hub_lines(nxt), ephemeral=True)
+
+
 @bot.tree.command(name='schedule_help', description='How the session scheduler works')
 async def schedule_help(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -503,7 +593,9 @@ async def schedule_help(interaction: discord.Interaction):
             '`/clear_availability <dates> [time]`: remove your availability\n'
             '`/my_availability`: your availability for the next 90 days\n'
             '`/calendar [month]`: month view\n'
-            '`/whosfree <date>`: who can play on a date, and when'
+            '`/whosfree <date>`: who can play on a date, and when\n'
+            '`/propose <date> <time> <goal> [party_size]`: suggest a session; the GM approves it\n'
+            '`/sessions`: what is planned'
         ),
         inline=False,
     )
@@ -513,7 +605,8 @@ async def schedule_help(interaction: discord.Interaction):
             '`/gm open <dates> [time] [note]`: when you can run\n'
             "`/gm block <dates> [time] [note]`: when you can't\n"
             '`/gm clear <dates> [time]`: remove your availability\n'
-            '`/gm pin_calendar`: post a self-updating calendar in this channel'
+            '`/gm pin_calendar`: post a self-updating calendar in this channel\n'
+            '`/gm hub_line`: next session as lines to paste into the hub'
         ),
         inline=False,
     )
