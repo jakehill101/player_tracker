@@ -612,9 +612,9 @@ async def subscribe(interaction: discord.Interaction):
     await interaction.response.send_message(
         'Subscribe to see every confirmed session in your own calendar. It updates by itself when sessions '
         'are added, moved or cancelled. Calendar apps refresh subscribed calendars every few hours (Google '
-        'can take up to a day), so for anything urgent trust the Discord card.\n\n'
+        'can take up to a day), so for anything urgent check Discord.\n\n'
         'For Apple Calendar or anything else, copy this address:\n'
-        f'```{webcal_url(url)}```Keep it to the group: anyone with the address can see the sessions.',
+        f'```{webcal_url(url)}```',
         view=view, ephemeral=True)
 
 
